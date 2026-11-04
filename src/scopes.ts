@@ -153,12 +153,28 @@ export function requiredScope(toolName: string): Scope {
   return scopesFor(toolName)[0];
 }
 
+/**
+ * stdio carries no authInfo and is unrestricted by default. BW_STDIO_SCOPES (comma-separated,
+ * e.g. `read`) makes it behave like an HTTP caller holding exactly those scopes, so a local
+ * client can be kept off the write tools without hosting the server.
+ */
+const STDIO_SCOPES = (process.env.BW_STDIO_SCOPES ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function effective(authInfo: AuthInfo | undefined): AuthInfo | undefined {
+  if (authInfo || STDIO_SCOPES.length === 0) return authInfo;
+  return { token: '', clientId: 'stdio', scopes: STDIO_SCOPES };
+}
+
 /** Accepts bare or XSUAA-qualified scopes (`bwmcp!t123.read`). */
 function has(scopes: readonly string[], scope: Scope): boolean {
   return scopes.some((s) => s === scope || s.endsWith(`.${scope}`));
 }
 
 export function hasScope(authInfo: AuthInfo | undefined, scope: Scope): boolean {
+  authInfo = effective(authInfo);
   if (!authInfo) return true; // stdio
   const scopes = authInfo.scopes ?? [];
   if (has(scopes, scope)) return true;
@@ -167,6 +183,7 @@ export function hasScope(authInfo: AuthInfo | undefined, scope: Scope): boolean 
 
 /** May this caller invoke this tool? True when any scope admitting it is held. */
 export function mayCall(toolName: string, authInfo: AuthInfo | undefined): boolean {
+  authInfo = effective(authInfo);
   if (!authInfo) return true; // stdio
   return scopesFor(toolName).some((s) => hasScope(authInfo, s));
 }
@@ -176,6 +193,7 @@ export function filterToolsByScope<T extends { name: string }>(
   tools: T[],
   authInfo: AuthInfo | undefined,
 ): T[] {
+  authInfo = effective(authInfo);
   if (!authInfo) return tools;
   return tools.filter((t) => mayCall(t.name, authInfo));
 }

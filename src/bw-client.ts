@@ -1,6 +1,7 @@
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import http from 'http';
 import https from 'https';
+import tls from 'tls';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -311,13 +312,25 @@ function tracksLock(type: string): boolean {
 }
 
 /**
+ * Server certificates are verified against Node's built-in roots plus the PEM bundle in
+ * BW_CA_FILE, for a company CA that signs the BW host's certificate. BW_TLS_INSECURE=true
+ * turns verification off again, for systems with a self-signed certificate.
+ */
+function tlsOptions(): https.AgentOptions {
+  if (process.env.BW_TLS_INSECURE?.trim().toLowerCase() === 'true') return { rejectUnauthorized: false };
+  const caFile = process.env.BW_CA_FILE?.trim();
+  if (!caFile) return { rejectUnauthorized: true };
+  return { rejectUnauthorized: true, ca: [...tls.rootCertificates, fs.readFileSync(caFile, 'utf8')] };
+}
+
+/**
  * One connection pool for every client. Without keep-alive each request opened a TCP and TLS
  * connection of its own, and on some hosts a share of new connections stalls for about 20
  * seconds before failing. The SAP session travels in the cookies, not in the connection, so
  * clients can share sockets. Idle sockets are closed after 30 s, far below the ICM's own idle
  * limit (300 s measured), so a request is never sent on a socket the server is closing.
  */
-const sharedHttpsAgent = new https.Agent({ rejectUnauthorized: false, keepAlive: true, timeout: 30_000 });
+const sharedHttpsAgent = new https.Agent({ ...tlsOptions(), keepAlive: true, timeout: 30_000 });
 
 /**
  * Behind the Cloud Connector proxy no connection is reused. The connectivity proxy ties a
@@ -327,7 +340,7 @@ const sharedHttpsAgent = new https.Agent({ rejectUnauthorized: false, keepAlive:
  * principals on one socket. The proxy runs next to the app, so a new connection costs little.
  */
 const proxyHttpAgent = new http.Agent({ keepAlive: false });
-const proxyHttpsAgent = new https.Agent({ rejectUnauthorized: false, keepAlive: false });
+const proxyHttpsAgent = new https.Agent({ ...tlsOptions(), keepAlive: false });
 
 function agentsFor(proxied: boolean): { httpAgent?: http.Agent; httpsAgent: https.Agent } {
   return proxied
