@@ -163,6 +163,25 @@ A second addition follows the same rules on both platforms: aggregation levels. 
 
 ---
 
+## Focused Tool Surface
+
+The focused surface (`src/surface/focused.ts`), the default since the tool-selection benchmark showed it
+holds up, puts a reduced surface in front of the full one without touching a handler; `BW_TOOL_MODE=full`
+offers the full one instead. The operation table maps every full tool to one focused tool and one discriminator
+value (`type` for reads, `operation` for everything else; no full tool has a parameter of either name).
+Everything else is derived from that table and the full tool definitions at `tools/list` time: the
+discriminator enum with a one-line summary and the required parameters per value, the union of the
+members' parameter schemas (reads share one `name`, translated back to the member's own parameter on
+the call), and the folding of nested item schemas above a size limit to type plus first sentence with a
+pointer to `bw_describe`, which answers with the member's full schema. Because the focused tools are built
+from the *offered* full tools, the scope and platform filters need no second table: what they remove is
+gone from the discriminators too. A call is resolved to the full tool and handed to the same dispatcher,
+so the full tool's scope check, platform check and argument validation apply. Full tool names stay
+callable in focused mode, and the full tool names in the platform instructions are rewritten to the
+focused calls. The test suite asserts that every full tool is covered exactly once, that the full
+mode is unchanged, and that the payload stays about a third of the full one; a tool-selection
+benchmark sends the same prompts against both surfaces and compares the first call's tool and parameters.
+
 ## Push API
 
 Write-interface aDSOs support direct data push via a separate API:
@@ -188,6 +207,8 @@ src/
 ├── destination.ts        # builds a BwClient from a BTP destination (PrincipalPropagation or BasicAuthentication)
 ├── request-context.ts    # AsyncLocalStorage holding the per-request BW client under principal propagation
 ├── scopes.ts             # read/write scope classification and tools/list filtering for XSUAA role-based access
+├── surface/
+│   └── focused.ts        # the focused tool surface: operation table, schema derivation, call resolution, bw_describe
 ├── soap-rfc.ts           # calling an RFC-enabled function module over /sap/bc/soap/rfc, with a clear
 │                         # message when the ICF service is inactive
 ├── arguments.ts          # refusal of undeclared arguments to writing tools
@@ -195,7 +216,7 @@ src/
 ├── classic-writes.ts     # per-write-tool status on a classic release, printed by bw_system_profile
 ├── bw-client.ts          # HTTP client (CSRF, session, lock/unlock, GET/PUT/POST/rawGet/rawPost/rawPut)
 └── tools/
-    ├── activation.ts     # bw_activate, bw_unlock
+    ├── activation.ts     # bw_activate, bw_check, bw_unlock
     ├── adso.ts           # bw_get_adso, bw_create_adso, bw_update_adso
     ├── adso_data.ts      # bw_set_adso_planning_mode, bw_delete_adso_data_selective — BW/4HANA
     │                     # manage API for the runtime state and the data of an aDSO
@@ -257,7 +278,7 @@ src/
     │                     # and dependencies resolved into execution order
     ├── logon_user.ts     # the logon user of the system, written as the responsible of new objects
     │                     # when BW_USER is not set (destination, principal propagation)
-    ├── openhub.ts        # bw_get_open_hub
+    ├── openhub.ts        # bw_get_open_hub, bw_create_open_hub, bw_update_open_hub
     ├── planning.ts       # bw_get_aggregation_level, bw_create_aggregation_level,
     │                     # bw_update_aggregation_level, bw_get_planning_properties,
     │                     # bw_get_planning_sequence, bw_get_planning_function
@@ -272,7 +293,9 @@ src/
     ├── process_chain_monitor.ts # bw_list_process_chain_runs, bw_get_process_chain_run_detail,
     │                            # bw_list_process_chain_last_status — OData-based monitoring
     ├── process_chain_run.ts # bw_start_process_chain — asynchronous start through the BW/4HANA
-    │                        # Cockpit monitoring API, then the run status by log ID
+    │                        # Cockpit monitoring API, then the run status by log ID;
+    │                        # bw_restart_process_chain_step — "Repeat" of a failed step
+    │                        # through the BW4_PCM_SRV function import ChainProcessRestart
     ├── processchain.ts   # bw_get_process_chain — reads RSPC via bw4 API; auto-fetches variant details per step
     ├── processchain_write.ts # bw_create_process_chain, bw_update_process_chain,
     │                         # bw_activate_process_chain, bw_append_process_chain_dtp,
@@ -404,7 +427,9 @@ system serves a lower resource version than the fallback.
 | Purpose | Endpoint |
 |---|---|
 | **Activation** | `POST /sap/bw/modeling/activation` |
-| **Check (pre-activation)** | `POST /sap/bw/modeling/checkruns` |
+| **Check (pre-activation)** | `POST /sap/bw/modeling/checkruns` — same body as the activation, nothing is generated (`bw_check`) |
+| Value conversion (internal ↔ external) | `POST /sap/bw/modeling/is/values/valueInputConversion` — partition bounds of an aDSO, with overlap and range checks |
+| aDSO feature switches | `GET /sap/bw/modeling/adso/{adsonm}/configuration` — what the system offers for this aDSO (dynamic partitioning, …) |
 | ABAP syntax check (ADT) | `POST /sap/bc/adt/checkruns?reporters=abapCheckRun` (DTP filter routine gate) |
 | ELEM component enqueue (lock/unlock) | `POST /sap/bw/modeling/comp/enq/{compid}?action=lock\|unlock` (RKF/Query create) |
 | Validation | `GET /sap/bw/modeling/validation?objectType=...&objectName=...` |
@@ -506,6 +531,7 @@ server's own to end, so the logoff is skipped there.
 | Purpose | Endpoint |
 |---|---|
 | Component value validator | `/sap/bw/modeling/comp/validator` (RKF restriction value → internal key) |
+| Hierarchy as the query editor reads it | `/sap/bw/modeling/comp/hierarchy?characteristic=…&hierarchy=…&iprov=…&members=true` (text node or value, internal and external key — node restrictions in query structures) |
 | InfoObjects | `/sap/bw/modeling/is/values/infoobject` |
 | InfoProviders | `/sap/bw/modeling/is/values/infoprovider` |
 | DataSources | `/sap/bw/modeling/is/values/datasources` |

@@ -364,6 +364,8 @@ function holdsLock(client: BwClient): boolean {
  */
 const sessionScope = new AsyncLocalStorage<Set<BwClient>>();
 const openScopes = new Set<Set<BwClient>>();
+/** The scope every client of this process joins, once trackSessionsForProcess() has set it up. */
+let processScope: Set<BwClient> | undefined;
 const SESSION_CLOSE_TIMEOUT_MS = 5000;
 
 /** `BW_SESSION_CLOSE=off` keeps sessions open, for a proxy that holds the session itself. */
@@ -417,6 +419,23 @@ export async function closeAllSessions(): Promise<void> {
   lockSessions.clear();
   logoffInBackground(clients);
   await sessionsClosed();
+}
+
+/**
+ * Track every session of this process in one scope and end them all when the process is about to
+ * exit. For scripts that call the tool functions directly, outside the server's per-call scope:
+ * without it every client they create keeps its logon until the backend's session timeout, and a
+ * series of such scripts fills the backend with sessions (50 of them, 65 MB each, brought a single
+ * instance to "server resources exhausted").
+ */
+export function trackSessionsForProcess(): void {
+  const scope = new Set<BwClient>();
+  openScopes.add(scope);
+  processScope = scope;
+  let closing: Promise<void> | undefined;
+  process.on('beforeExit', () => {
+    if (!closing) closing = closeAllSessions();
+  });
 }
 
 export class BwClient {
@@ -634,6 +653,7 @@ export class BwClient {
     // On every response rather than at construction: a client cached across calls has to be
     // ended by each call that used it, not only by the one that built it.
     sessionScope.getStore()?.add(this);
+    processScope?.add(this);
     const setCookies = response.headers['set-cookie'];
     if (!setCookies) return;
     if (this.sessionDebug) {
@@ -1071,6 +1091,46 @@ export class BwClient {
     this.csrfToken = null;
     if (response.status >= 400) {
       throw bwHttpError(`DELETE ${path}`, response.status, response.data);
+    }
+    return response.data as string;
+  }
+
+  /**
+   * Run the activation checks of one BW object without activating it.
+   *
+   * The modeling tools' "Check" button: the same request body as an activation, posted to the
+   * check collection. Nothing is generated and no lock is needed. The answer is the feed of
+   * check messages; a failed check is HTTP 200 with error entries.
+   */
+  async check(type: string, name: string, sourceSystem?: string): Promise<string> {
+    await this.ensureCsrf();
+    const mediaType = resolveMediaType(type);
+    const typeLower = type.toLowerCase();
+    const href = typeLower === 'rsds'
+      ? `/sap/bw/modeling/rsds/${bwSegUpper(name)}/${(sourceSystem ?? '').toUpperCase()}/m`
+      : `/sap/bw/modeling/${typeLower}/${bwSeg(name)}/m`;
+    const body = `<?xml version="1.0" encoding="UTF-8"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom" xmlns:bwModel="http://www.sap.com/bw/modeling">
+  <atom:entry>
+    <atom:content type="${mediaType}">
+      <bwModel:checkProperties version="inactive" modelContent="" lockHandle=""/>
+    </atom:content>
+    <atom:link href="${href}" type="application/*" rel="self"/>
+  </atom:entry>
+</atom:feed>`;
+    const response = await this.http.post('/sap/bw/modeling/checkruns', body, {
+      headers: {
+        'Content-Type': 'application/atom+xml;type=entry',
+        Accept: 'application/atom+xml;type=feed',
+        'X-CSRF-Token': this.csrfToken!,
+        ...this.cookieHeaders(),
+      },
+      responseType: 'text',
+    });
+    this.updateCookies(response);
+    this.csrfToken = null;
+    if (response.status >= 400) {
+      throw bwHttpError(`Check of ${type}/${name}`, response.status, response.data);
     }
     return response.data as string;
   }

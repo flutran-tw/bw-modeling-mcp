@@ -10,6 +10,49 @@ For the architecture and the full endpoint list, see [ARCHITECTURE.md](ARCHITECT
 
 ---
 
+## Tool modes
+
+The server offers 21 tools by default, about a third of the tool payload of the full set in the
+model's context; `BW_TOOL_MODE=full` offers every operation as a tool of its own instead, as documented
+in the reference below. Every operation stays reachable in the default mode: a focused tool stands for
+a group of full tools and selects one of them through its `type` (reads) or `operation` (everything
+else) parameter, then hands the call to that tool's handler unchanged — same parameters, same enums,
+same behaviour. The parameters of a focused tool are the union of its members' parameters, each marked with
+the operations that use it; `bw_read` takes one `name` in place of the members' own name parameters.
+Large nested item schemas (query operations, process chain steps) keep their type and first sentence,
+and `bw_describe(tool, operation)` returns the complete definition of one operation. A wrong or missing
+`operation` is refused with the allowed values before anything reaches BW, and so is a missing required
+parameter. The scope and platform filters apply to the members, so an operation the caller may not
+invoke or the system cannot answer is not listed, and the routes the server's instructions give on a classic
+release name the focused calls. A full tool name remains callable in focused mode, so a client holding the
+full list keeps working.
+
+| Focused tool | Selector | Operations (full tool in brackets) |
+|---|---|---|
+| `bw_read` | `type` | `adso` (get_adso), `iobj` (get_infoobject), `area` (get_infoarea), `trcs` (get_infosource), `trfn` (get_transformation), `dtpa` (get_dtp), `query` (get_query), `hcpr` (get_composite_provider), `ckf` (get_ckf), `rkf` (get_rkf), `structure` (get_structure), `variable` (get_variable), `rsds` (get_datasource), `lsys` (get_source_system), `dest` (get_open_hub), `rspc` (get_process_chain), `process_variant` (get_process_variant), `alvl` (get_aggregation_level), `plse` (get_planning_function), `plsq` (get_planning_sequence), `planning_filter` (get_planning_filter), `planning_properties` (get_planning_properties), `conversion_type` (get_conversion_type), `hierarchy` (get_hierarchy), `push_schema` (get_push_schema), `afo_workbook` (get_afo_workbook), `query_roles` (get_query_roles) |
+| `bw_find` | `operation` | `search` (search), `xref` (xref), `contents` (list_contents), `dataflow` (get_dataflow), `dtps` (get_dtps), `source_systems` (list_source_systems), `datasources` (list_datasources), `remote_entities` (list_remote_entities), `afo_workbooks` (list_afo_workbooks), `roles` (get_roles), `role_queries` (get_role_queries), `metadata_tables` (read_metadata_tables), `system_profile` (system_profile) |
+| `bw_monitor` | `operation` | `requests` (list_requests), `request` (get_request), `chain_runs` (list_process_chain_runs), `chain_run_detail` (get_process_chain_run_detail), `chain_last_status` (list_process_chain_last_status), `remodeling_requests` (list_remodeling_requests), `remodeling_request` (get_remodeling_request), `query_statistics` (query_statistics) |
+| `bw_query_data` | `operation` | `run` (query_data) |
+| `bw_data` | `operation` | `filter_values` (get_filter_values), `preview_datasource` (preview_datasource), `push` (push_data), `delete_selective` (delete_adso_data_selective), `save_afo_workbook` (save_afo_workbook) |
+| `bw_activate` | `operation` | `activate` (activate), `check` (check), `unlock` (unlock), `activate_process_chain` (activate_process_chain) |
+| `bw_delete` | `operation` | `delete` (delete) |
+| `bw_run` | `operation` | `dtp` (run_dtp), `process_chain` (start_process_chain), `restart_chain_step` (restart_process_chain_step), `activate_request` (activate_request), `delete_request` (delete_request), `remodeling` (run_remodeling) |
+| `bw_write_adso` | `operation` | `create` (create_adso), `update` (update_adso), `set_planning_mode` (set_adso_planning_mode) |
+| `bw_write_infoobject` | `operation` | `create` (create_infoobject), `update` (update_infoobject), `create_hierarchy` (create_hierarchy), `update_hierarchy` (update_hierarchy), `delete_hierarchy` (delete_hierarchy) |
+| `bw_write_infosource` | `operation` | `create` (create_infosource), `update` (update_infosource) |
+| `bw_write_composite_provider` | `operation` | `create` (create_composite_provider), `update` (update_composite_provider) |
+| `bw_write_transformation` | `operation` | `create` (create_transformation), `update_rule` (update_transformation), `set_routine` (set_transformation_routine), `set_expert_routine` (set_transformation_expert_routine), `set_routine_fields` (set_transformation_routine_fields), `delete_routine` (delete_transformation_routine), `set_runtime` (set_transformation_runtime) |
+| `bw_write_dtp` | `operation` | `create` (create_dtp), `update` (update_dtp), `set_filter_routine` (set_dtp_filter_routine) |
+| `bw_write_datasource` | `operation` | `create` (create_datasource), `set_fields` (set_datasource_fields), `change_delta` (change_datasource_delta) |
+| `bw_write_open_hub` | `operation` | `create` (create_open_hub), `update` (update_open_hub) |
+| `bw_write_query` | `operation` | `create` (create_query), `update_layout` (update_query_layout), `update_filter` (update_query_filter), `update_key_figures` (update_query_key_figures), `update_characteristic` (update_query_characteristic), `update_cells` (update_query_cells), `update_exceptions` (update_query_exceptions), `update_settings` (update_query_settings), `create_rkf` (create_rkf), `update_rkf` (update_rkf), `create_ckf` (create_ckf), `update_ckf` (update_ckf), `create_structure` (create_structure), `update_structure` (update_structure), `create_variable` (create_variable), `update_variable` (update_variable), `set_roles` (set_query_roles) |
+| `bw_write_planning` | `operation` | `create_aggregation_level` (create_aggregation_level), `update_aggregation_level` (update_aggregation_level), `create_function` (create_planning_function), `update_function` (update_planning_function), `create_sequence` (create_planning_sequence), `update_sequence` (update_planning_sequence), `create_filter` (create_planning_filter), `update_filter` (update_planning_filter), `create_conversion_type` (create_conversion_type) |
+| `bw_write_process_chain` | `operation` | `create` (create_process_chain), `update` (update_process_chain), `append_dtp` (append_process_chain_dtp), `swap_dtp` (swap_process_chain_dtp), `add_program` (add_process_chain_program), `add_plswitch` (add_process_chain_plswitch), `add_edge` (add_process_chain_edge), `remove_edge` (remove_process_chain_edge), `remove_step` (remove_process_chain_step), `add_error_links` (add_process_chain_error_links), `create_decision_variant` (create_decision_variant) |
+| `bw_manage` | `operation` | `create_infoarea` (create_infoarea), `move_object` (move_object), `change_package` (change_package), `create_transport_task` (create_transport_task), `changeable_transports` (list_changeable_transports) |
+| `bw_describe` | — | the catalogue, or the full parameter definition of one operation |
+
+---
+
 ## Contents
 
 - [Discovery & System](#discovery--system) — 6 tools
@@ -21,7 +64,7 @@ For the architecture and the full endpoint list, see [ARCHITECTURE.md](ARCHITECT
 - [DTP (Data Transfer Process)](#dtp-data-transfer-process) — 6 tools
 - [DataSource & Source Systems](#datasource--source-systems) — 9 tools
 - [CompositeProvider](#compositeprovider) — 3 tools
-- [Open Hub Destination](#open-hub-destination) — 1 tool
+- [Open Hub Destination](#open-hub-destination) — 3 tools
 - [BW Query — modeling](#bw-query--modeling) — 20 tools
 - [BW Query — data & roles](#bw-query--data--roles) — 10 tools
 - [Integrated Planning](#integrated-planning) — 13 tools
@@ -30,7 +73,7 @@ For the architecture and the full endpoint list, see [ARCHITECTURE.md](ARCHITECT
 - [Process Chains — monitoring](#process-chains--monitoring) — 3 tools
 - [Requests, Runtime & Remodeling](#requests-runtime--remodeling) — 7 tools
 - [Push API](#push-api) — 2 tools
-- [General](#general) — 3 tools
+- [General](#general) — 4 tools
 
 ---
 
@@ -78,10 +121,15 @@ Create a new aDSO. Supports two modes: `from_template` (copies structure from an
 Modify an existing aDSO. Actions:
 - `add_field` — add an InfoObject-backed field
 - `add_pure_field` — add a field-based (pure) field without an InfoObject
-- `remove_field` — remove a field
-- `manage_keys` — set or update key fields
-- `update_field_properties` — change aggregation, data type, length, etc.
-- `update_settings` — change aDSO type preset, flags, or description
+- `remove_field` — remove a field together with its key, partition, hash key, index and criteria entries; a field other fields are compounded to, or take their unit from, is refused until those are removed too
+- `manage_keys` — set the key fields; a field that does not exist, a key figure, an aggregating field or a data type that cannot be key is refused, and the compounding parents of a key field are added
+- `manage_partitions` — replace the partitioning: static ranges on a key field (any characteristic field in a data mart), or dynamic partitioning on a time characteristic or date field with a granularity; an empty `partitioning` removes it
+- `update_field_properties` — change aggregation, SID determination mode, fixed unit or currency, the field group or the description of one field
+- `update_settings` — change the aDSO type, its sub-options (change log, snapshot, unique records), planning mode, write interface, data tiering (`temperature_schema`) or the description
+
+`add_field` brings along what an InfoObject cannot stand without — the compounding parents of a characteristic and the unit InfoObject of a key figure — and gives each field the SID determination mode of its InfoObject type. A type change is written as a whole and drops what the new type cannot carry (key definition, partitioning); the answer names everything that was added or removed along the way.
+
+Partition bounds are values in internal format (a date as `20260131`); a partition covers [low, high), and overlapping or reversed ranges are refused with the server's message. A classic BW release takes the bounds in external format instead.
 
 
 Field groups: `dimension` takes the bare group name — `"__KEYFIGURES"`, `"DATA"`, whatever the aDSO declares — on `add_field` and `add_pure_field` to create the field in that group directly, and under `properties` on `update_field_properties` to move an existing one. Group names are defined per aDSO; an unknown name is rejected with the declared groups listed. The current assignment is the `DIM` column of `bw_get_adso`.
@@ -106,6 +154,11 @@ Create a new InfoObject. Supports:
 
 Created as inactive — activate with `bw_activate`.
 
+An amount or quantity key figure gets its currency or unit either fixed (`fixed_currency`,
+`fixed_unit`) or per record from a unit characteristic (`unit_currency_infoobject`, e.g. the
+currency or unit-of-measure characteristic). One of the two is needed for activation; they exclude
+each other.
+
 `lower_case` switches off the permitted-character check (RSKC) for the characteristic, which is
 what makes values holding lower case letters or umlauts loadable at all. Without it such a value
 passes the load itself — a push even answers HTTP 204 — and is only rejected later, when the
@@ -113,10 +166,22 @@ request is activated.
 
 ### `bw_update_infoobject`
 Change the description, the lower case flag (`lower_case`), or the attribute list of an existing
-Characteristic; set `fixed_unit` / `fixed_currency` on a Key Figure. Supplying `attributes`
+Characteristic; set `fixed_unit` / `fixed_currency` on a Key Figure, or `unit_currency_infoobject`
+to take the unit or currency from a unit characteristic instead (a fixed one is removed). Supplying `attributes`
 replaces the whole list (`[]` removes all of them); omitting it leaves the attributes untouched.
 The lower case flag can be changed on a characteristic that is already used by a provider holding
 data — a request that failed activation on such a value can then be activated again.
+
+An attribute can be a characteristic, time characteristic, unit or key figure; only a characteristic or
+time characteristic that is not attribute-only can be a navigation attribute, and `time_dependent` works
+for display and navigation attributes alike. The compounding parents of an attribute and the unit
+InfoObject of a key figure attribute come along and are reported. Master data (`with_master_data`), texts
+(`with_texts`, `short_text`, `medium_text`, `long_text`, `extra_long_text`, `texts_language_dependent`,
+`texts_time_dependent`) and hierarchies (`with_hierarchies`, `hierarchy_version_dependent`,
+`hierarchy_time_dependency`, `hierarchy_intervals`, `hierarchy_reverse_sign`) are switched per parameter.
+
+The call saves and activates. When BW refuses the activation, the answer says so with the server's
+messages: the change is then saved in the inactive version and the active version is unchanged.
 
 ### `bw_get_hierarchy` _(Read only)_
 Without `hierarchy_name`, the hierarchies of a characteristic with version, validity, levels and node
@@ -186,11 +251,16 @@ Read a Transformation structure including all field mapping rules, routines, sou
 Create a new Transformation. Supports all source types (aDSO, InfoSource, DataSource/RSDS) and all target types (aDSO). For InfoObject (`IOBJ`) sources or targets, set `source_object_subtype` / `target_object_subtype` to select the facet — `TEXT` (text table), `ATTR` (attributes / master data), or `HIER` (hierarchy). Can copy structure from an existing Transformation. In a transportable package, `transport` records it on the given request; `activate: true` activates it in the same call, and the answer then carries the activation messages.
 
 ### `bw_update_transformation`
-Modify field mappings in an existing Transformation:
-- Map source field to target InfoObject (StepDirect)
+Modify field mappings in an existing Transformation, changing the type of the rule of a field from whatever type it has now, as the rule editor of the modeling tools does:
+- Map a source field to a target field (StepDirect). A target that is a time characteristic gets a time conversion (StepTime) instead — the only assignment the modeling tools offer there; `rule_type: "time"` asks for one explicitly and is refused for any other target. Whether the two time characteristics convert into each other (a month from a day, a year from a month) is checked by the server on activation
+- Convert a rule to an AMDP field routine (StepRoutine) from any type. Every source field the rule has stays and is wired into the routine; `source_field` and `additional_source_fields` add further ones, and a rule without any source needs `source_field`. A rule that already is a routine keeps its class and method, which is how source fields are added to an existing routine
+- Set a constant (StepConstant) on a target field from any rule type
+- Read a value from an InfoObject or a DataStore object (StepRead, lookup). The read step gets one input per key field of the lookup object, each bound to a source field, as the read dialog of the modeling tools does: a key field takes the source field of its own name, `lookup_key_mapping` names the others, and `source_field` alone feeds the InfoObject itself or the one key still open. A key without a source is refused before anything is written, because the activation check would refuse it. A DataStore object can be read from only with direct update, or with activation and a change log (a staging aDSO without change log cannot); the tool refuses any other before anything is written, with the reason
+- Remove a mapping with `rule_type: "no_update"`: a key field becomes StepInitial (filled with its initial value), any other field StepNoUpdate — the only reset the modeling tools offer for either kind
+- A rule that maps a key figure together with its unit or currency keeps the unit half when the key figure's type changes — BW couples the two as soon as the transformation allows currency and unit handling; the unit half itself is changed through the key figure, or given a rule of its own by mapping the key figure without `unit_source_field`. A rule with a currency or unit conversion step is refused until the conversion is removed. A field that had no mapping and gets one is added to the field list of the END routine, when there is one
 - Set or change the formula rule of a target field (StepFormula) — every operand of the expression is registered as a source of the rule, so a formula over several source fields works, and the formula text of an existing formula rule can be replaced
 - On a key figure with a currency or unit, a direct, formula or constant rule takes the value over unconverted. With `conversion` a direct rule converts it instead — `type` `"currency"` with a currency translation type or `"unit"` with a unit conversion type, given as `name`. The name is checked against the conversion types defined on the system; the source currency or unit comes from `source_unit_field`, else from the source key figure's own unit reference, and a conversion type with a fixed source needs neither
-- Set the aggregation type of a rule into a target key figure with `aggregation`: `SUM` (summation), `MOV` (overwrite), `MIN`, `MAX` or `NOP` (no aggregation). It decides what happens when several source records end up in one target record — in an aggregating transformation a key figure on `MOV` keeps one record per group without any error. Given with only `transformation_name` and `target_infoobject`, it changes the aggregation and leaves the rule as it is; given with a rule change, both are saved together. A characteristic, an unknown field and a target field whose aggregation the target fixes are refused
+- Set the aggregation type of a rule into a target key figure with `aggregation`: `SUM` (summation), `MOV` (overwrite), `MIN`, `MAX` or `NOP` (no aggregation). It decides what happens when several source records end up in one target record — in an aggregating transformation a key figure on `MOV` keeps one record per group without any error. Given with only `transformation_name` and `target_infoobject`, it changes the aggregation and leaves the rule as it is; given with a rule change, both are saved together. Possible values are `MOV`, `NOP` and the key figure's own aggregation (`SUM` for a key figure without one): `MIN` or `MAX` only for a key figure that aggregates that way, and `MOV` not into a data mart DataStore object; BW would otherwise keep a different value without a message, so anything else is refused with the possible values. A characteristic, an unknown field and a target field whose aggregation the target fixes are refused
 
 ### `bw_set_transformation_routine`
 Set a field routine, start routine, or end routine on a Transformation. Supports both ABAP and AMDP (SQLScript). The routine code is written in combination with an ADT MCP server.
@@ -279,7 +349,9 @@ Fields the tool creates are ready for a query: a field named after its InfoObjec
 
 `update_navigation_attributes` switches navigation attributes of the one field in `info_object_name` on (`enabled` true, the default) or off (`enabled` false). Name them in `navigation_attributes` by attribute name or as `<FIELD_IOBJ>__<ATTR_NAME>`; only navigation attributes of the field's InfoObject qualify, and an unknown name is refused with the offered ones listed. In a union every part provider that supplies the field must deliver the attribute as well: an aDSO does, an aggregation level or a CompositeProvider below only when it lists the attribute as a field. The result names the parts that cannot (`unsupported_parts`), since activation would refuse them. A CompositeProvider with a navigation attribute switched on lists it as a field, and an aggregation level on it takes it over as a characteristic of the same name; such an aggregation level cannot itself be a part provider of another CompositeProvider.
 
-Two things to know: both sides of a join key must be mapped onto the **same** target field, otherwise activation fails with "join fields need at least one common target field" — auto-mapping deliberately does not do this, so map the second side's key fields explicitly. And `remove_input` leaves the removed input's elements and any join referencing it behind; those have to be cleaned up separately.
+Joins: both sides of a join key need a common target field. `update_join` maps the right key onto the field the left key feeds, creating it if needed, and names it in the answer; a key that leaves the condition is fed by the left input only again, since in a join only a key field may be fed by both sides. `remove_join` empties the last join of a node instead of removing it. `remove_input` leaves the removed input's fields in place so a replacement input can feed them — auto-mapping reuses fields no input feeds — and the join condition has to be set again afterwards.
+
+Compounding: a compounded field needs its compounding parent as a field. `add_field`, `add_input` and `update_mapping` add and map the parent when the CompositeProvider has none, and `remove_field` refuses a compounding parent and the common target field of a join condition while they are needed.
 
 ---
 
@@ -287,6 +359,12 @@ Two things to know: both sides of a join key must be mapped onto the **same** ta
 
 ### `bw_get_open_hub` _(Read only)_
 Read an Open Hub Destination (DEST) — destination type, source, DB table, InfoArea, package, status, and the complete output field list with type/length, InfoObject binding, conversion routine, compounding and key flag, plus the file properties when the destination type is FILE.
+
+### `bw_create_open_hub`
+Create an Open Hub Destination from a template object — an aDSO, a CompositeProvider or a query released as an InfoProvider. The fields and the key of the template are copied and the database table name is generated. A table destination takes the write mode (insert, delete and insert, overwrite), a technical key and the connection type; a file destination the file type (CSV, fixed length, XML), file name, separator and whether the file lies on the application server or the workstation. Combinations BW does not allow are refused before anything is sent. Activate with `bw_activate` (object type `dest`); the destination loads through a transformation and a DTP with target type `DEST`.
+
+### `bw_update_open_hub`
+Change an Open Hub Destination: description, the database options of a table destination, the file options of a file destination, the semantic key, the external format of fields, the RFC notification, and add, remove or rename fields. BW recreates the database table on every activation and refuses it while the table holds data, so delete the destination's requests first.
 
 ---
 
@@ -307,7 +385,7 @@ Edit the query filter — fixed value restrictions on characteristics. Accepts a
 ### `bw_update_query_key_figures`
 Edit the query key figures — add basic key figures, references to global RKFs/CKFs, and local formula members; set exception aggregation on formula members, display properties (decimals, scaling, hidden, sign inversion), planning properties (input readiness, disaggregation, constant selection) and the local calculation (calculate results as, calculate single values as, use single values for the result, cumulation); nest members under others and insert them at a position; remove members. An unknown property or calculation literal is refused rather than dropped. Formula members accept a recursive operator/operand tree covering the full BW operator catalog (basic, percentage, data, mathematical, trigonometric, and boolean operators plus ternary `IF`); operator codes are case-insensitive and their operand counts are validated before saving. An operand can be a formula variable (`{ "type": "variable", "variable_name": "..." }`); it is embedded in the query on save, and a characteristic variable is refused. Exception aggregation is refused on a selection member — a basic key figure or a CKF/RKF reference — because the backend drops it there without an error on a classic release and on BW/4HANA alike; set it on the CKF itself instead. An aggregation type outside the sixteen literals of the aggregation domain is refused too, rather than being stored as standard aggregation.
 
-A member restriction can name a `hierarchy`: its values are then nodes of that hierarchy, and `node_variable` restricts by a hierarchy node variable, which is embedded in the query on save. `set_member_restrictions` replaces or removes the restriction of an existing member on one characteristic and keeps its key figure. `switch_hierarchy` moves every node restriction of the structure — fixed nodes and node variables alike — from `from_hierarchy` to `to_hierarchy` in one save, with `node_map` for nodes named differently in the new hierarchy; given a member, only that member is switched. Hierarchies and nodes are checked before the save; a value node is refused. `structure: "characteristics"` addresses the second structure of a query, the one without key figures. `add_structure` creates it in `structure_target` (rows or columns), at `position` among the characteristics and the key figure structure already there, with an optional `description`; BW does not save an empty structure, so it has to be followed by at least one `add_selection` in the same call. `add_selection` adds a member there and `add_formula` a formula — a delta or a percentage between two selections, for example — both at an optional `position`; a formula there computes with members of that structure, constants and formula variables, and an operand naming a key figure or a CKF/RKF is refused. Removing, hiding, restricting and reordering members work as in the key figure structure. Restricting one characteristic in both structures is refused, as in the modeling tools. Accepts an optional `transport` request number.
+A member restriction can name a `hierarchy`: its values are then nodes of that hierarchy, and `node_variable` restricts by a hierarchy node variable, which is embedded in the query on save. `set_member_restrictions` replaces or removes the restriction of an existing member on one characteristic and keeps its key figure. `switch_hierarchy` moves every node restriction of the structure — fixed nodes and node variables alike — from `from_hierarchy` to `to_hierarchy` in one save, with `node_map` for nodes named differently in the new hierarchy; given a member, only that member is switched. Hierarchies and nodes are checked before the save. A node is a text node, given by its name, or a characteristic value in the tree, given by its external or internal key. Where a hierarchy holds a text node and a characteristic value of the same name, `node_type` (`"text"` or `"value"`) on the value says which one is meant; without it such a name is refused with both listed. `switch_hierarchy` takes the key of each node from the new hierarchy and keeps its kind where the new hierarchy has the name as both. `structure: "characteristics"` addresses the second structure of a query, the one without key figures. `add_structure` creates it in `structure_target` (rows or columns), at `position` among the characteristics and the key figure structure already there, with an optional `description`; BW does not save an empty structure, so it has to be followed by at least one `add_selection` in the same call. `add_selection` adds a member there and `add_formula` a formula — a delta or a percentage between two selections, for example — both at an optional `position`; a formula there computes with members of that structure, constants and formula variables, and an operand naming a key figure or a CKF/RKF is refused. Removing, hiding, restricting and reordering members work as in the key figure structure. Restricting one characteristic in both structures is refused, as in the modeling tools. Accepts an optional `transport` request number.
 
 ### `bw_update_query_settings`
 Edit query properties (settings). Accepts an optional `transport` request number.
@@ -482,6 +560,9 @@ Activate an existing Process Chain. Returns the top-level activation message, se
 ### `bw_start_process_chain`
 Start a process chain once, now, as the BW/4HANA Cockpit does with "Execute": asynchronously, in the background under the technical user of the chain, independent of its start condition and without changing its scheduling. Returns the log ID of the run, its status and the messages of the steps reached so far. `wait_seconds` (up to 600) waits for the run to end, checking every five seconds. Follow the run with `bw_get_process_chain_run_detail`. The synchronous start is not offered: it runs inside the HTTP request, where an abort message of a step cannot be shown. BW/4HANA only.
 
+### `bw_restart_process_chain_step`
+Repeat a failed or canceled step of a process chain run, as the process chain monitor does with "Repeat": the step runs again as a new instance within the same run (step number `n-2`, `n-3`, …) and the chain continues from there along its success links. Use it once the cause of the failure is removed, instead of starting the whole chain again, which would run every finished step a second time. Without `process_id` the single failed or canceled step is repeated; with several, name one. Finished, running and never-run steps are refused. The backend answers the call the same whether or not it started anything, so the tool reads the run again and reports the new instance — or says that none is visible. BW/4HANA only.
+
 ### `bw_append_process_chain_dtp`
 Add one DTP load step (optionally followed by its own DSO activation step) to an existing Process Chain. `before` / `after` place the whole block **in series** relative to an existing step — the target's incoming (or outgoing) edges are rerouted through the block, so the new steps really run ahead of (or behind) it. Without them the block is only appended behind the strand end and runs in parallel to the target's existing successors.
 
@@ -565,6 +646,9 @@ Push a JSON record array directly into a write-interface aDSO via the BW Push AP
 
 ### `bw_activate`
 Activate one or more BW objects. Handles impact analysis and automatically deactivated DTPs. Supports: `adso`, `iobj`, `trfn`, `dtp`, `rsds` (DataSource).
+
+### `bw_check`
+Run the activation checks of one BW object without activating it, as "Check" in the modeling tools does. The saved, inactive version is validated exactly as an activation would validate it; nothing is generated and the active version stays as it is. Needs no lock handle. Returns whether the object is consistent, with the errors, warnings and information messages of the check. Supports the object types of `bw_activate`. Read-only.
 
 ### `bw_unlock`
 Release a lock on a BW object without activating (discard changes).

@@ -15,6 +15,7 @@ import { createRequire } from 'node:module';
 import { closeAllSessions, createClientFromEnv, withSessionScope, type BwClient } from './bw-client.js';
 import { currentClient } from './request-context.js';
 import { filterToolsByScope, mayCall, requiredScope, scopesFor } from './scopes.js';
+import { buildFocusedTools, resolveFocusedCall, toolMode, translateToolNames, type ToolDefinition } from './surface/focused.js';
 import { undeclaredArguments } from './arguments.js';
 import {
   cachedPlatform,
@@ -23,13 +24,13 @@ import {
   platformInstructions,
   unavailableReason,
 } from './platform.js';
-import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties } from './tools/adso.js';
+import { bwGetAdso, bwCreateAdso, FieldDef, bwUpdateAdso, bwUpdateAdsoAddPureField, bwUpdateAdsoSettings, AdsoSettings, bwUpdateAdsoManageKeys, bwUpdateAdsoFieldProperties, FieldProperties, bwUpdateAdsoPartitions, PartitionSpec } from './tools/adso.js';
 import { bwGetInfoObject, bwCreateInfoObject, bwUpdateInfoObject, AttributeDef } from './tools/infoobject.js';
 import { bwGetTransformation, bwUpdateTransformation, bwCreateTransformation, bwSetTransformationRuntime, bwSetTransformationRoutine, bwDeleteTransformationRoutine, bwSetTransformationRoutineFields, bwSetTransformationExpertRoutine, type RuleConversion } from './tools/transformation.js';
-import { bwActivate } from './tools/activation.js';
+import { bwActivate, bwCheck } from './tools/activation.js';
 import { bwSystemProfile } from './tools/system_profile.js';
 import { bwReadMetadataTables } from './tools/metadata_tables.js';
-import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilterRoutine, bwUnlockDtp, DtpFilterSelectionInput } from './tools/dtp.js';
+import { bwGetDtps, bwGetDtp, bwCreateDtp, bwRunDtp, bwUpdateDtp, bwSetDtpFilterRoutine, bwUnlockDtp, DtpFilterSelectionInput, type UpdateDtpArgs } from './tools/dtp.js';
 import { bwSearch, bwXref } from './tools/search.js';
 import { bwDelete } from './tools/delete.js';
 import { bwCreateInfoArea, bwMoveObject, bwGetInfoarea } from './tools/infoarea.js';
@@ -108,7 +109,7 @@ import {
   bwRunRemodeling,
   type RemodelingAction,
 } from './tools/remodeling.js';
-import { bwGetOpenHub } from './tools/openhub.js';
+import { bwGetOpenHub, bwCreateOpenHub, bwUpdateOpenHub, type OpenHubCreateOptions, type OpenHubUpdateOptions } from './tools/openhub.js';
 import {
   bwGetAggregationLevel,
   bwCreateAggregationLevel,
@@ -143,7 +144,7 @@ import { bwCreatePlanningSequence, bwUpdatePlanningSequence, type CreatePlanning
 import { bwCreatePlanningFilter, bwUpdatePlanningFilter, type CreatePlanningFilterArgs, type UpdatePlanningFilterArgs } from './tools/planning_filter_write.js';
 import { bwListProcessChainRuns, bwGetProcessChainRunDetail, bwListProcessChainLastStatus } from './tools/process_chain_monitor.js';
 import { bwCreateProcessChain, bwUpdateProcessChain, bwActivateProcessChain, bwAddProcessChainErrorLinks, bwSwapProcessChainDtp, bwAppendProcessChainDtp, bwAddProcessChainProgram, bwAddProcessChainPlanningSwitch, bwAddProcessChainEdge, bwRemoveProcessChainEdge, bwRemoveProcessChainStep, bwCreateDecisionVariant, CreateProcessChainParams, UpdateProcessChainParams, EdgeDef, EdgeStatus, TriggerEventConfig } from './tools/processchain_write.js';
-import { bwStartProcessChain, MAX_WAIT_SECONDS } from './tools/process_chain_run.js';
+import { bwStartProcessChain, bwRestartProcessChainStep, MAX_WAIT_SECONDS } from './tools/process_chain_run.js';
 import { bwCreateTransportTask } from './tools/transport.js';
 
 // Map the snake_case trigger_event tool argument to the TriggerEventConfig shape.
@@ -529,10 +530,12 @@ const TOOL_DEFINITIONS = [
       description:
         'Add/remove fields, change aDSO type/settings, manage key fields, or update individual field properties. ' +
         'action "add_field" (default): add one or more InfoObject-backed fields — infoobject_name required. ' +
-        'action "remove_field": removes the field from the aDSO (and from the key if it was a key field). ' +
+        'What an InfoObject cannot stand without comes along and is reported: the compounding parents of a characteristic and the unit InfoObject of a key figure. ' +
+        'action "remove_field": removes the field from the aDSO together with everything that points at it (key, partitioning, hash key, indexes, criteria). A field other fields are compounded to, or take their unit from, is refused until those are removed too. ' +
         'action "add_pure_field": add one or more pure (non-InfoObject) fields — pass fields array with name, label, data_type, optional length/precision/scale/aggregation_behavior/is_key. ' +
-        'action "update_settings": change aDSO type preset and/or individual boolean flags — no infoobject_name needed. ' +
-        'action "manage_keys": replace the complete key field list — pass key_fields array (empty = no key fields). ' +
+        'action "update_settings": change the aDSO type, its sub-options, planning mode, write interface or data tiering — no infoobject_name needed. A type change drops what the new type cannot carry (key definition, partitioning) and says so. ' +
+        'action "manage_keys": replace the complete key field list — pass key_fields array (empty = no key fields). Key fields must exist, must not aggregate and must not be key figures; compounding parents of a key field are added to the key. ' +
+        'action "manage_partitions": replace the partitioning of the active table — pass partitioning with field and either ranges (static) or dynamic: true; an empty partitioning removes it. ' +
         'action "update_field_properties": modify sidDeterminationMode, aggregationBehavior, fixedCurrency/Unit, a unit/currency field reference (unit_currency_field), the field group (dimension), or descriptions of a single field — pass field_name and properties. ' +
         'Field groups: pass "dimension" on add_field/add_pure_field to place new fields in the right group straight away — a field added without it lands in the catch-all group and moving it afterwards costs a second activation. ' +
         'Returns a lock_handle that must be passed to bw_activate to complete the operation. ' +
@@ -550,8 +553,8 @@ const TOOL_DEFINITIONS = [
           },
           action: {
             type: 'string',
-            enum: ['add_field', 'remove_field', 'add_pure_field', 'update_settings', 'manage_keys', 'update_field_properties'],
-            description: '"add_field" (default), "remove_field", "add_pure_field", "update_settings", "manage_keys", or "update_field_properties".',
+            enum: ['add_field', 'remove_field', 'add_pure_field', 'update_settings', 'manage_keys', 'manage_partitions', 'update_field_properties'],
+            description: '"add_field" (default), "remove_field", "add_pure_field", "update_settings", "manage_keys", "manage_partitions", or "update_field_properties".',
           },
           fields: {
             type: 'array',
@@ -566,7 +569,7 @@ const TOOL_DEFINITIONS = [
                 precision: { type: 'number', description: 'Total digits. For DEC (required) and, optionally, for CURR/QUAN (total length, default 17 when only scale is given).' },
                 scale: { type: 'number', description: 'Decimal places. Required for CURR/QUAN (> 0 — BW rejects scale 0) and used for DEC. Emitted as the XML scale attribute.' },
                 aggregation_behavior: { type: 'string', enum: ['SUM', 'MIN', 'MAX', 'AVG', 'LAST', 'NONE'], description: 'Aggregation (default SUM for numeric types). Use NONE for no aggregation.' },
-                is_key: { type: 'boolean', description: 'If true, also injects a <keyElement> entry.' },
+                is_key: { type: 'boolean', description: 'If true, the field also becomes a key field. A key field does not aggregate: a numeric key field is written with aggregation NONE.' },
                 dimension: { type: 'string', description: 'Field group ("Feldgruppe") to place the field in, given as the bare group name — e.g. "__KEYFIGURES" for the key figure group or "ALL" for the catch-all. Must be a group the aDSO declares; an unknown name is rejected with the declared groups listed rather than silently falling back. Read the current assignment from the DIM column of bw_get_adso.' },
               },
               required: ['name', 'label', 'data_type'],
@@ -583,7 +586,7 @@ const TOOL_DEFINITIONS = [
               sid_determination_mode: {
                 type: 'string',
                 enum: ['N', 'R', 'S', 'M'],
-                description: 'Master data check mode (InfoObject-backed fields only). N=none, R=reporting only, S=load/activate, M=load+SID.',
+                description: 'Master data check mode (InfoObject-backed fields only). N=none, R=reporting only, S=load/activate, M=load+SID. New fields get the default of their InfoObject type (S for characteristics, N for key figures and attribute-only characteristics). Which modes are offered depends on the InfoObject and the aDSO type; a mode that is not offered is refused with the offered ones listed.',
               },
               local_description: {
                 description: 'Local description override (InfoObject-backed). String to override, null to clear (revert to InfoObject text).',
@@ -591,7 +594,7 @@ const TOOL_DEFINITIONS = [
               aggregation_behavior: {
                 type: 'string',
                 enum: ['SUM', 'MIN', 'MAX', 'AVG', 'LAST', 'NONE'],
-                description: 'Aggregation behavior (pure fields only). Use NONE for no aggregation.',
+                description: 'Aggregation behavior (pure fields only). Use NONE for no aggregation. A key field or the partitioning field cannot aggregate.',
               },
               fixed_currency: {
                 description: 'Fixed currency code (pure CURR fields). String to set, null to switch to dynamic currency.',
@@ -629,14 +632,50 @@ const TOOL_DEFINITIONS = [
               adso_type: {
                 type: 'string',
                 enum: ['standard', 'staging_inbound_only', 'staging_compress', 'staging_reporting', 'datamart', 'direct_update'],
-                description: 'aDSO type preset. Sets activateData, cubeDeltaOnly, directUpdate, isReportingObject, noAqDeletion.',
+                description: 'aDSO modeling type. Written as a whole: the flags of the previous type are reset. A data mart and the staging types without active data have no key definition, an inbound-only aDSO no partitioning either — both are removed on the change and reported.',
               },
-              write_changelog: { type: 'boolean', description: 'Write change log (Standard type sub-option).' },
-              snap_shot_scenario: { type: 'boolean', description: 'Snapshot support (Standard type sub-option).' },
-              unique_data_records: { type: 'boolean', description: 'Unique records (Standard type sub-option).' },
+              write_changelog: { type: 'boolean', description: 'Write change log (standard type only; default true when the type changes to standard).' },
+              snap_shot_scenario: { type: 'boolean', description: 'Snapshot support (standard type only; needs the change log and excludes unique_data_records).' },
+              unique_data_records: { type: 'boolean', description: 'Unique records (standard type only; excludes snap_shot_scenario).' },
               planning_mode: { type: 'boolean', description: 'Planning enabled.' },
               write_interface: { type: 'boolean', description: 'Enable or disable write interface (pushMode).' },
+              temperature_schema: {
+                type: 'string',
+                enum: ['HO', 'WO', 'HWO', 'HWP'],
+                description: 'Data tiering of the aDSO: "HO" hot only (default), "WO" warm only, "HWO" hot and warm chosen for the whole object, "HWP" hot and warm chosen per partition (needs a partitioning). Warm storage needs an aDSO with active data or direct update and a system with a warm store.',
+              },
               label: { type: 'string', description: 'aDSO description text.' },
+            },
+          },
+          partitioning: {
+            type: 'object',
+            description: 'Partitioning to write (only for action "manage_partitions"). Replaces the existing partitioning; pass an empty object to remove it.',
+            properties: {
+              field: {
+                type: 'string',
+                description: 'Field the partitions are defined on, e.g. "FIELD_NAME". Must be a key field (any characteristic field in a data mart) and must not be a key figure.',
+              },
+              ranges: {
+                type: 'array',
+                description: 'Static range partitions in the order they are numbered. Bounds are values of the field in internal format (a month as "202601", a date as "20260131"); a classic BW release takes them in external format instead and says so when a bound is refused. A partition covers [low, high): the upper bound is exclusive, so the next partition starts at the previous upper bound. Overlapping ranges are refused.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    low: { type: 'string', description: 'Lower bound of the partition.' },
+                    high: { type: 'string', description: 'Upper bound of the partition.' },
+                  },
+                  required: ['low', 'high'],
+                },
+              },
+              dynamic: {
+                type: 'boolean',
+                description: 'true lets the server create partitions as data arrives, instead of ranges. Needs a calendar or fiscal time characteristic or a field of type DATS, and is not available for direct update.',
+              },
+              granularity: {
+                type: 'string',
+                enum: ['0CALDAY', '0CALWEEK', '0CALMONTH', '0CALQUARTER', '0CALYEAR', '0FISCPER', '0FISCYEAR', '0FISCWEEK', '0FISCQRT'],
+                description: 'Granularity of dynamic partitions. Which ones are offered depends on the field (a month field offers month, quarter and year); the default is the year, or the week for week fields.',
+              },
             },
           },
           dimension: {
@@ -730,11 +769,19 @@ const TOOL_DEFINITIONS = [
           },
           fixed_unit: {
             type: 'string',
-            description: 'Fixed unit of measure for QUAN key figures (e.g. "KWH", "M3"). Required when object_specific_data_type is QUAN.',
+            description:
+              'Fixed unit of measure for QUAN key figures (e.g. "KWH", "M3"). A QUAN key figure needs either this or unit_currency_infoobject.',
           },
           fixed_currency: {
             type: 'string',
-            description: 'Fixed currency for CURR key figures (e.g. "EUR"). Required when object_specific_data_type is CURR.',
+            description:
+              'Fixed currency for CURR key figures (e.g. "EUR"). A CURR key figure needs either this or unit_currency_infoobject.',
+          },
+          unit_currency_infoobject: {
+            type: 'string',
+            description:
+              'KYF only. Unit characteristic that supplies the unit or currency per record, instead of a fixed one ' +
+              '(e.g. "0CURRENCY" for a CURR key figure, "0UNIT" for a QUAN key figure). Excludes fixed_unit/fixed_currency.',
           },
           // common
           package: {
@@ -788,7 +835,7 @@ const TOOL_DEFINITIONS = [
         properties: {
           source_object_type: {
             type: 'string',
-            description: 'Source object type. Valid values: HCPR (CompositeProvider), ADSO (aDSO), RSDS (DataSource — requires source_system), HAAP (HANA Analysis Process), IOBJ (InfoObject), TRCS (InfoSource), QVIW (Query).',
+            description: 'Source object type. Valid values: HCPR (CompositeProvider), ADSO (aDSO), RSDS (DataSource — requires source_system), HAAP (HANA Analysis Process), IOBJ (InfoObject), TRCS (InfoSource), ELEM (query released as an InfoProvider; source_object_name is the technical name of the query, the target is an Open Hub Destination).',
           },
           source_object_name: {
             type: 'string',
@@ -939,10 +986,11 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_update_infoobject',
       description:
-        'Update a Characteristic InfoObject: change description, the lower case flag, and/or replace the attribute list. ' +
+        'Update a Characteristic InfoObject: description, the lower case flag, master data, text and hierarchy properties, and/or the attribute list. ' +
         'Supplying attributes replaces all existing ones (pass an empty array to remove all); omitting them leaves the list untouched. ' +
-        'Also supports Key Figure (KYF) updates: set fixed_unit or fixed_currency. ' +
-        'Sequence: lock → GET → PUT → activate → unlock — all in one call.',
+        'An attribute can be any characteristic, time characteristic, unit or key figure; the compounding parents of an attribute and the unit InfoObject of a key figure attribute come along and are reported. ' +
+        'Also supports Key Figure (KYF) updates: set fixed_unit or fixed_currency, or unit_currency_infoobject to take the unit/currency from a unit characteristic. ' +
+        'Sequence: lock → GET → PUT → activate → unlock — all in one call. When the activation is refused the answer says so with the server messages: the change then sits in the inactive version and the active one is unchanged.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -975,6 +1023,38 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             description: 'KYF only. Fixed currency (e.g. "EUR"). Sets fixedCurrency on a CURR key figure.',
           },
+          unit_currency_infoobject: {
+            type: 'string',
+            description:
+              'KYF only. Unit characteristic that supplies the unit or currency per record (e.g. "0CURRENCY", "0UNIT"). ' +
+              'Replaces a fixed unit/currency; excludes fixed_unit/fixed_currency.',
+          },
+          with_master_data: {
+            type: 'boolean',
+            description: 'CHA only. Characteristic has master data (attributes). Switched on automatically with the first attribute; switching it off needs attributes: [] in the same call.',
+          },
+          with_texts: {
+            type: 'boolean',
+            description: 'CHA only. Characteristic has texts. Switching texts on selects the short text unless a text length is given.',
+          },
+          short_text: { type: 'boolean', description: 'CHA only. Short text (20 characters) exists.' },
+          medium_text: { type: 'boolean', description: 'CHA only. Medium text (40 characters) exists.' },
+          long_text: { type: 'boolean', description: 'CHA only. Long text (60 characters) exists.' },
+          extra_long_text: { type: 'boolean', description: 'CHA only. Long text is extra long (1333 characters); needs long_text.' },
+          texts_language_dependent: { type: 'boolean', description: 'CHA only. Texts are language-dependent.' },
+          texts_time_dependent: { type: 'boolean', description: 'CHA only. Texts are time-dependent.' },
+          with_hierarchies: {
+            type: 'boolean',
+            description: 'CHA only. Characteristic can have hierarchies. Needed before a hierarchy can be created for it.',
+          },
+          hierarchy_version_dependent: { type: 'boolean', description: 'CHA only. Hierarchies are version-dependent.' },
+          hierarchy_time_dependency: {
+            type: 'string',
+            enum: ['none', 'entire_hierarchy', 'structure'],
+            description: 'CHA only. Time dependency of the hierarchies: "none", "entire_hierarchy" (each hierarchy has a validity period) or "structure" (the nodes have validity periods).',
+          },
+          hierarchy_intervals: { type: 'boolean', description: 'CHA only. Intervals are permitted in hierarchies.' },
+          hierarchy_reverse_sign: { type: 'boolean', description: 'CHA only. The sign of nodes can be reversed.' },
           attributes: {
             type: 'array',
             description: 'New attribute list, replacing all existing ones. Pass [] to remove all attributes; omit to leave them unchanged.',
@@ -982,10 +1062,10 @@ const TOOL_DEFINITIONS = [
               type: 'object',
               properties: {
                 name: { type: 'string', description: 'Technical name of the referenced InfoObject (e.g. "ATTR_IOBJ_NAME").' },
-                type: { type: 'string', enum: ['DIS', 'NAV'], description: 'Attribute type: DIS (Display) or NAV (Navigation).' },
-                time_dependent: { type: 'boolean', description: 'Time-dependent attribute (NAV only, default false).' },
+                type: { type: 'string', enum: ['DIS', 'NAV'], description: 'Attribute type: DIS (Display) or NAV (Navigation). Only a characteristic or time characteristic that is not attribute-only can navigate; key figures and units are display attributes.' },
+                time_dependent: { type: 'boolean', description: 'Time-dependent attribute, display or navigation (default false).' },
                 display_in_query: { type: 'boolean', description: 'Display in query (default true).' },
-                use_text_of_original_characteristic: { type: 'boolean', description: 'Use text of original characteristic (default true).' },
+                use_text_of_original_characteristic: { type: 'boolean', description: 'Navigation attributes: use the text of the original characteristic (default true).' },
               },
               required: ['name', 'type'],
             },
@@ -1019,15 +1099,16 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_update_transformation',
       description:
-        'Map a source field to a target InfoObject in a Transformation, or convert an existing rule to a field routine (StepRoutine) or formula rule (StepFormula). ' +
-        'rule_type="direct" (default): changes a StepNoUpdate/StepInitial rule to StepDirect. ' +
-        'rule_type="routine": converts an existing StepDirect, StepInitial, or StepNoUpdate rule to StepRoutine (AMDP field routine). ' +
+        'Map a source field to a target field in a Transformation, or change the type of the rule of a field — direct, time conversion, routine, formula, constant, lookup, or no mapping — from whatever type it has now, as the rule editor of the modeling tools does. ' +
+        'rule_type="direct" (default): maps the source field directly (StepDirect). A target that is a time characteristic gets a time conversion (StepTime) instead, the only assignment the modeling tools offer there. ' +
+        'rule_type="time": a time conversion into a time characteristic (StepTime), e.g. a month derived from a day; refused for a target that is not a time characteristic. Whether the two time characteristics convert into each other is checked by the server on activation. ' +
+        'rule_type="routine": converts the rule to a StepRoutine (AMDP field routine) from any type. Every source field the rule has stays and is wired into the routine; source_field and additional_source_fields add further ones. A rule without any source needs source_field. A rule that already is a routine keeps its class and method, so this also adds source fields to an existing routine. ' +
         'rule_type="formula": writes the rule as StepFormula whatever step type it has now, including an existing formula rule whose text is to be changed — no ABAP class generated, BW evaluates the formula natively. ' +
         'Every operand of the expression is registered as a source of the rule, so a formula over several source fields works; the operands are read out of the formula and need not be listed. ' +
-        'rule_type="constant": sets a fixed constant value on the target field — no source field needed. ' +
-        'For routine on StepNoUpdate rules, source_field is required. ' +
-        'For routine on StepDirect/StepInitial rules, source_field is ignored (field is already mapped). ' +
-        'source_field is always ignored for rule_type="constant". ' +
+        'rule_type="constant": sets a fixed constant value on the target field from any rule type — no source field needed, source_field is ignored. ' +
+        'rule_type="no_update": removes the mapping. A key field becomes StepInitial (filled with its initial value), any other field StepNoUpdate — the only reset the modeling tools offer for either kind. ' +
+        'A rule that maps a key figure together with its unit or currency keeps the unit half when the type of the key figure changes; the unit half itself is changed through the key figure. A rule with a currency or unit conversion step is refused until the conversion is removed. ' +
+        'A field that had no mapping and gets one is added to the field list of the END routine, when there is one. ' +
         'rule_type="direct" with unit_source_field set: creates a COMBINED key-figure + unit/currency ' +
         'direct rule (multi-source/target) — maps a quantity together with its unit (or an amount with ' +
         'its currency) in one rule, as the Eclipse rule editor shows it. ' +
@@ -1045,9 +1126,9 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             description:
               'Source field name in the source segment (e.g. "FIELD_NAME"). ' +
-              'Required for rule_type="direct" if the existing rule has no source mapping. ' +
-              'Also required for routine/formula when the target has no source mapping yet (StepNoUpdate). ' +
-              'Required for rule_type="lookup".',
+              'Required for rule_type="direct" and "time" if the existing rule has no source mapping. ' +
+              'Also required for routine/formula when the rule has no source field yet. ' +
+              'For rule_type="lookup" it feeds the InfoObject read from, or the one key field no source field is named for.',
           },
           target_infoobject: {
             type: 'string',
@@ -1055,14 +1136,15 @@ const TOOL_DEFINITIONS = [
           },
           rule_type: {
             type: 'string',
-            enum: ['direct', 'routine', 'formula', 'constant', 'lookup', 'no_update'],
+            enum: ['direct', 'time', 'routine', 'formula', 'constant', 'lookup', 'no_update'],
             description:
-              'Rule type to assign. "direct" (default): maps source field directly (StepDirect). ' +
-              '"routine": converts the rule to an AMDP field routine (StepRoutine) — the server generates the ABAP class automatically. ' +
+              'Rule type to assign. "direct" (default): maps the source field directly (StepDirect); a time characteristic target gets StepTime instead. ' +
+              '"time": time conversion into a time characteristic (StepTime). ' +
+              '"routine": converts the rule to an AMDP field routine (StepRoutine) from any type, keeping its source fields — the server generates the ABAP class automatically. ' +
               '"formula": writes the rule as a formula rule (StepFormula) — requires the formula parameter; also used to change the formula text of an existing formula rule. ' +
-              '"constant": sets a fixed constant value (StepConstant) — requires the constant_value parameter, source_field is ignored. ' +
+              '"constant": sets a fixed constant value (StepConstant) from any type — requires the constant_value parameter, source_field is ignored. ' +
               '"lookup": converts the rule to a StepRead (Lookup) rule — requires lookup_object and lookup_object_type. ' +
-              '"no_update": reverts any existing mapping back to StepNoUpdate (no mapping, field stays empty). ' +
+              '"no_update": removes the mapping — StepInitial for a key field, StepNoUpdate for any other. ' +
               'IMPORTANT: AMDP SQLSCRIPT methods only allow ASCII 7-bit characters — no German umlauts or special symbols in code or comments.',
           },
           formula: {
@@ -1090,16 +1172,26 @@ const TOOL_DEFINITIONS = [
           lookup_object_type: {
             type: 'string',
             enum: ['IOBJ', 'ADSO'],
-            description: 'Type of the lookup object. "IOBJ" for InfoObject, "ADSO" for aDSO. Required for rule_type="lookup".',
+            description:
+              'Type of the lookup object. "IOBJ" for InfoObject, "ADSO" for aDSO. Required for rule_type="lookup". ' +
+              'An aDSO can be read from only with direct update, or with activation and a change log; any other aDSO is refused before anything is written.',
+          },
+          lookup_key_mapping: {
+            type: 'object',
+            additionalProperties: { type: 'string' },
+            description:
+              'For rule_type="lookup": which source field feeds each key field of the lookup object (key field → source field), ' +
+              'e.g. {"KEY_FIELD": "SOURCE_FIELD"}. A key field whose name exists in the source segment takes that field on its own; ' +
+              'source_field alone feeds the InfoObject itself or the one key that is still open. Every key field must end up with a source, ' +
+              'or the rule does not activate.',
           },
           additional_source_fields: {
             type: 'array',
             items: { type: 'string' },
             description:
-              'Additional source fields for rule_type="formula" when the formula references more than one source field. ' +
-              'Combined with source_field, all listed fields are registered as inputs on the StepFormula rule — alongside ' +
-              'the operands read out of the formula itself, so this is only needed for a field the expression does not name ' +
-              'under its source-segment name. Example: ["QUANTITY_SOLD", "COST_PER_UNIT"].',
+              'Additional source fields for rule_type="formula" and "routine". For a formula, combined with source_field, all listed fields are registered as inputs ' +
+              'on the StepFormula rule — alongside the operands read out of the formula itself, so this is only needed for a field the expression does not name ' +
+              'under its source-segment name. For a routine, the fields are wired into the routine next to the ones the rule already has. Example: ["QUANTITY_SOLD", "COST_PER_UNIT"].',
           },
           unit_source_field: {
             type: 'string',
@@ -1138,8 +1230,11 @@ const TOOL_DEFINITIONS = [
               'Aggregation type of the rule on a target key figure: "SUM" (summation), "MOV" (overwrite), "MIN", "MAX" ' +
               'or "NOP" (no aggregation). It decides what happens when several source records end up in one target ' +
               'record. Given alone (with transformation_name and target_infoobject only), it changes the aggregation ' +
-              'and leaves the rule as it is; given with a rule change, both are saved together. Refused for a target ' +
-              'field whose aggregation the target does not let a transformation override.',
+              'and leaves the rule as it is; given with a rule change, both are saved together. Possible are MOV, NOP ' +
+              'and the key figure\'s own aggregation (SUM for one without aggregation); MIN or MAX only for a key ' +
+              'figure that aggregates that way, and MOV not into a data mart DataStore object. Anything else is ' +
+              'refused with the possible values, as is a target field whose aggregation the target does not let a ' +
+              'transformation override.',
           },
           transport: {
             type: 'string',
@@ -1322,6 +1417,36 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
+      name: 'bw_check',
+      description:
+        'Run the activation checks of one BW object without activating it — the "Check" of the modeling tools. ' +
+        'The saved, inactive version is validated exactly as an activation would validate it; nothing is generated and the active version stays as it is. ' +
+        'Needs no lock handle and releases none, so it fits between two changes of the same object. ' +
+        'Returns consistent true or false with the errors, warnings and information messages of the check. ' +
+        'Use it before bw_activate to see whether the activation would go through, and after a failed activation to check a correction.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          object_type: {
+            type: 'string',
+            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl', 'dest'],
+            description:
+              'Object type: adso, trfn, dtpa, iobj, trcs, rsds (DataSource), hcpr (CompositeProvider), ' +
+              'alvl (Aggregation Level) or dest (Open Hub Destination).',
+          },
+          object_name: {
+            type: 'string',
+            description: 'Object name (e.g. "OBJECT_NAME" or "DTP_..."). For rsds, the DataSource name.',
+          },
+          source_system: {
+            type: 'string',
+            description: 'Source system name. Required when object_type is "rsds" (e.g. "LSYS_NAME").',
+          },
+        },
+        required: ['object_type', 'object_name'],
+      },
+    },
+    {
       name: 'bw_activate',
       description:
         'Activate one BW object (aDSO, Transformation, DTP, InfoObject, InfoSource, DataSource, CompositeProvider, or Aggregation Level). ' +
@@ -1335,10 +1460,10 @@ const TOOL_DEFINITIONS = [
         properties: {
           object_type: {
             type: 'string',
-            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl'],
+            enum: ['adso', 'trfn', 'dtpa', 'iobj', 'trcs', 'rsds', 'hcpr', 'alvl', 'dest'],
             description:
               'Object type: adso, trfn, dtpa, iobj, trcs, rsds (DataSource), hcpr (CompositeProvider), ' +
-              'or alvl (Aggregation Level).',
+              'alvl (Aggregation Level) or dest (Open Hub Destination).',
           },
           object_name: {
             type: 'string',
@@ -2074,7 +2199,7 @@ const TOOL_DEFINITIONS = [
           },
           source_type: {
             type: 'string',
-            description: 'Source object type (e.g. "ADSO", "TRCS", "RSDS"). Use "RSDS" for a DataSource source — source_system is then required.',
+            description: 'Source object type (e.g. "ADSO", "TRCS", "RSDS"). Use "RSDS" for a DataSource source — source_system is then required. Use "ELEM" for a query released as an InfoProvider; source_name is then the technical name of the query.',
           },
           source_system: {
             type: 'string',
@@ -2197,6 +2322,92 @@ const TOOL_DEFINITIONS = [
           transport: {
             type: 'string',
             description: 'Transport request number. Required on systems with transport obligation.',
+          },
+          package_size: {
+            type: 'number',
+            description: 'Extraction: package size in records (at least 1).',
+          },
+          parallel_extraction: {
+            type: 'boolean',
+            description: 'Extraction: extract data packages in parallel. Only when the server admits it for this DTP (see bw_get_dtp, PAR_X).',
+          },
+          technical_request_status: {
+            type: 'string',
+            enum: ['green', 'red'],
+            description: 'Execution: technical status of a request with warnings.',
+          },
+          overall_request_status: {
+            type: 'string',
+            enum: ['automatic', 'manual'],
+            description: 'Execution: how the overall request status is set. An Open Hub Destination that sets the status externally stays "manual".',
+          },
+          repeat_red_requests_in_process_chain: {
+            type: 'boolean',
+            description: 'Execution: automatically repeat red requests when the DTP runs in a process chain.',
+          },
+          extract_all_green_requests: {
+            type: 'boolean',
+            description: 'Request selection: extract all green requests (ignore the overall status). Only when the server admits it (IGNORE_QUALOK).',
+          },
+          retrieve_until_no_more_new_data: {
+            type: 'boolean',
+            description: 'Request selection: retrieve until no more new data (FETCHUNTILEOF).',
+          },
+          get_all_new_data_request_by_request: {
+            type: 'boolean',
+            description: 'Request selection, delta only: get all new data request by request (SINGLEREQUEST).',
+          },
+          delta_init_without_data: {
+            type: 'boolean',
+            description: 'Request selection, delta only: perform the delta initialization without data transfer (INITSIMU).',
+          },
+          only_retrieve_last_request: {
+            type: 'boolean',
+            description: 'Request selection: only retrieve the last request (ONLYLASTREQUEST).',
+          },
+          only_get_delta_once: {
+            type: 'boolean',
+            description: 'Request selection, delta only: only get the delta once (DELTAONLYONCE).',
+          },
+          request_handling: {
+            type: 'string',
+            enum: ['cancel_no_track', 'cancel_track_first', 'red_write_error_stack', 'green_write_error_stack'],
+            description: 'Error handling: what happens to a request with errors. Only the values the server admits for this DTP (ERRORHANDLING). Switching to an error stack sets the error count to 100 if it was 0; switching away sets it to 0 and clears record tracking.',
+          },
+          number_of_errors_per_package: {
+            type: 'number',
+            description: 'Error handling: maximum number of errors per package before the request is cancelled. Only with an error stack (request_handling red_* or green_*).',
+          },
+          track_records: {
+            type: 'boolean',
+            description: 'Error handling: track records after a failed request. Only with request_handling "cancel_no_track" and when the server admits it (TRACK_RECORDS).',
+          },
+          hana_execution: {
+            type: 'boolean',
+            description: 'Runtime: execute the DTP in SAP HANA. Only when the server allows it for this DTP; a DTP executed in SAP HANA has no temporary storage.',
+          },
+          level_of_detail: {
+            type: 'string',
+            enum: ['package', 'erroneous_records', 'record'],
+            description: 'Runtime: level of detail of the temporary storage (trace by package, erroneous records, or by record). Not available with SAP HANA execution.',
+          },
+          parallel_processes: {
+            type: 'number',
+            description: 'Batch manager: number of parallel processes (1..99).',
+          },
+          batch_class: {
+            type: 'string',
+            enum: ['high', 'medium', 'low'],
+            description: 'Batch manager: job priority (class A, B or C).',
+          },
+          server_type: {
+            type: 'string',
+            enum: ['servers', 'group', 'host'],
+            description: 'Batch manager: where the parallel jobs run; with "group" or "host", pass server_name.',
+          },
+          server_name: {
+            type: 'string',
+            description: 'Batch manager: the server group or host name for server_type "group" or "host"; an empty string clears it.',
           },
           transport_lock_holder: {
             type: 'string',
@@ -3009,9 +3220,10 @@ const TOOL_DEFINITIONS = [
                         type: 'string',
                         description:
                           'Hierarchy of the characteristic (e.g. "HIERARCHY_NAME"). When set, each value is a ' +
-                          'hierarchy node name, restricting to the node and everything below it; intervals and ' +
-                          'exclusions are not available for nodes. Version and key date stay blank. Also the ' +
-                          'hierarchy node_variable selects nodes of.',
+                          'node of that hierarchy, restricting to the node and everything below it: a text node ' +
+                          'by its name, or a characteristic value in the tree by its external or internal key. ' +
+                          'Intervals and exclusions are not available for nodes. Version and key date stay blank. ' +
+                          'Also the hierarchy node_variable selects nodes of.',
                       },
                       node_variable: {
                         type: 'string',
@@ -3034,6 +3246,14 @@ const TOOL_DEFINITIONS = [
                             internal_value: {
                               type: 'string',
                               description: 'Internal value for "value". Defaults to value if omitted.',
+                            },
+                            node_type: {
+                              type: 'string',
+                              enum: ['text', 'value'],
+                              description:
+                                'Only with hierarchy: which node is meant when the hierarchy holds a text node and a ' +
+                                'characteristic value of the same name — "text" for the text node, "value" for the ' +
+                                'characteristic value in the tree. Without it such a name is refused with both listed.',
                             },
                             description: {
                               type: 'string',
@@ -3117,6 +3337,12 @@ const TOOL_DEFINITIONS = [
           suppress_repeated_key_values: { type: 'boolean', description: 'Suppress repeated key values.' },
           show_scaling_factor: { type: 'boolean', description: 'Show the scaling factor.' },
           adjust_formatting: { type: 'boolean', description: 'Adjust formatting.' },
+          used_as_infoprovider: {
+            type: 'boolean',
+            description:
+              'Release the query as an InfoProvider. Required before the query can be the template of an Open Hub ' +
+              'Destination or the source of a transformation.',
+          },
           zero_presentation_kind: { type: 'string', description: 'Zero presentation kind (e.g. "withCurrency").' },
           zero_presentation_custom_value: { type: 'string', description: 'Custom value shown for zeros.' },
           hierarchy_display_rows: {
@@ -3363,7 +3589,8 @@ const TOOL_DEFINITIONS = [
       name: 'bw_update_query_characteristic',
       description:
         'Set the display and access properties of the characteristics in an existing BW Query - the ' +
-        'per-characteristic settings of the rows, columns, and free-characteristics areas: display of result ' +
+        'per-characteristic settings of the rows, columns, and free-characteristics areas: the query-specific ' +
+        'description of the characteristic, display of result ' +
         'rows, display as key/text, access type for result values (read mode), sorting, cumulation, display ' +
         'level, and the hierarchy assignment with its display options. Pass "*" as infoobject to apply one ' +
         'set of properties to every characteristic in the layout. Every property also accepts "default", ' +
@@ -3395,6 +3622,10 @@ const TOOL_DEFINITIONS = [
                   type: 'string',
                   enum: ['rows', 'columns', 'free'],
                   description: 'Restrict the change to one area. Omit to hit the characteristic wherever it sits.',
+                },
+                description: {
+                  type: 'string',
+                  description: 'Query-specific description of the characteristic, shown instead of the InfoObject text in the query and in Analysis for Office (e.g. to avoid a truncated short text). "default" drops it and falls back to the InfoObject text.',
                 },
                 result_rows: {
                   type: 'string',
@@ -3521,10 +3752,10 @@ const TOOL_DEFINITIONS = [
       description:
         'Change a CompositeProvider (HCPR): its fields, its source providers, their field mappings, the join condition, or root settings. ' +
         'Every action returns a lock_handle that must be passed to bw_activate (object type hcpr) — an HCPR cannot be activated without it. ' +
-        'Fields: "add_field" (default) adds an element plus a mapping in every part provider supplying it, taking the field metadata from there; "remove_field" removes the element and all mappings referencing it. ' +
-        'Sources: "add_input" attaches a source provider, creates the target elements it needs and returns the generated alias; "remove_input" strips one by alias, leaving its elements and any join reference behind. ' +
-        'Mappings: "update_mapping" replaces the complete mapping list of one input; pass no mappings to map every field of its source one to one. This is also how an input attached at creation time gets its mappings. ' +
-        'Joins: "update_join" sets the condition between one pair of inputs — call it once per pair to build an N-way join — and "remove_join" drops one pair. Note that both sides of a join key must be mapped onto the SAME target field, otherwise activation fails with "join fields need at least one common target field"; auto-mapping does not do this, so map the second side\'s key fields explicitly. ' +
+        'Fields: "add_field" (default) adds an element plus a mapping in every part provider supplying it, taking the field metadata from there; "remove_field" removes the element and all mappings referencing it, and refuses a field that is the common target of a join condition or the compounding parent of another field. A compounded field brings its compounding parent along wherever it is added or mapped. ' +
+        'Sources: "add_input" attaches a source provider, creates the target elements it needs and returns the generated alias; "remove_input" strips one by alias and leaves its fields in place, so a replacement input can feed them (auto-mapping reuses fields no input feeds). On a join node the condition has to be set again afterwards. ' +
+        'Mappings: "update_mapping" replaces the complete mapping list of one input; pass no mappings to map every field of its source one to one. This is also how an input attached at creation time gets its mappings. The result names fields that no input feeds any more. ' +
+        'Joins: "update_join" sets the condition between one pair of inputs — call it once per pair to build an N-way join — and "remove_join" drops one pair. Both sides of a join key need a common target field: update_join maps the right key onto the field the left key feeds (creating it if needed) and reports it; a key that leaves the condition goes back to being fed by the left input only, since in a join only a key field may be fed by both sides. ' +
         'Field groups and name usage: every field the tool creates goes into a field group (CHARACTERISTICS or KEYFIGURES unless dimension names another) and, when it is named after its InfoObject, uses that InfoObject directly by name — the form a query needs to find it. "update_fields" moves existing fields into a group and/or switches their name usage; "update_group" creates a group, changes its label or renames it. ' +
         'Navigation attributes: "update_navigation_attributes" switches navigation attributes of one InfoObject-bound field on or off. In a union every part provider that supplies the field must deliver the attribute too: an aDSO does, an aggregation level or another CompositeProvider only when it lists the attribute as a field; the result warns about parts that cannot. ' +
         'Settings: "update_settings" edits label, stackable, default node and aggregation behaviour.',
@@ -4919,10 +5150,11 @@ const TOOL_DEFINITIONS = [
     {
       name: 'bw_get_open_hub',
       description:
-        'Read an Open Hub Destination (TLOGO DEST) definition — destination type, source, ' +
-        'DB table, InfoArea, package, status, the complete output field list with type/length, ' +
-        'InfoObject binding, conversion routine, compounding, and key flag, ' +
-        'plus file properties when the destination type is FILE.',
+        'Read an Open Hub Destination (TLOGO DEST) definition — destination type, DB table, InfoArea, ' +
+        'package, status, database properties (write mode, technical key, connection) or file properties ' +
+        '(type, name, location, separator), third-party properties, RFC notification flags, and the ' +
+        'complete output field list with type/length, InfoObject binding, conversion routine, ' +
+        'compounding, key flag and external format.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -4930,6 +5162,171 @@ const TOOL_DEFINITIONS = [
             type: 'string',
             description: 'Technical name of the Open Hub Destination (e.g. "OBJECT_NAME").',
           },
+        },
+        required: ['open_hub_name'],
+      },
+    },
+    {
+      name: 'bw_create_open_hub',
+      description:
+        'Create an Open Hub Destination (TLOGO DEST) from a template object: the server copies the fields ' +
+        'and key of the given aDSO, CompositeProvider or query and generates the DB table name. ' +
+        'destination_type "TAB" writes into a database table (write mode, technical key, connection), ' +
+        '"FILE" into a flat file (CSV, fixed length or XML; on the application server or the local workstation). ' +
+        'Created inactive — call bw_activate with object_type "dest" and lock_handle "" afterwards, ' +
+        'then bw_create_dtp with target_type "DEST" to load it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          open_hub_name: {
+            type: 'string',
+            description: 'Technical name of the new Open Hub Destination (e.g. "OBJECT_NAME").',
+          },
+          description: {
+            type: 'string',
+            description: 'Description / label.',
+          },
+          info_area: {
+            type: 'string',
+            description: 'InfoArea to create the destination in (e.g. "INFOAREA_NAME").',
+          },
+          package: {
+            type: 'string',
+            description: 'Development package (default "$TMP").',
+          },
+          destination_type: {
+            type: 'string',
+            enum: ['TAB', 'FILE'],
+            description: 'TAB = database table, FILE = flat file. Default "TAB".',
+          },
+          template_object_name: {
+            type: 'string',
+            description: 'Technical name of the object whose fields and key are copied (an aDSO, a CompositeProvider or a query).',
+          },
+          template_object_type: {
+            type: 'string',
+            enum: ['ADSO', 'HCPR', 'QUERY'],
+            description:
+              'Type of the template object. Default "ADSO". "QUERY" copies the output of a query: its characteristics, and each key ' +
+              'figure of the structure with its unit or currency field. The query must be released as an InfoProvider ' +
+              '(bw_update_query_settings, used_as_infoprovider); the destination is then loaded through a transformation and a DTP ' +
+              'with the query as source type "ELEM". In a table destination the key figure fields get the names FIELDNM001, FIELDNM002, ..., ' +
+              'since a field name may have 16 characters and the server names them after the id of the structure member.',
+          },
+          write_mode: {
+            type: 'string',
+            enum: ['INSERT', 'DEL_INSERT', 'OVERWRITE'],
+            description: 'TAB only. INSERT (default), DEL_INSERT (delete table contents, then insert) or OVERWRITE (needs a semantic key, not allowed with use_technical_key).',
+          },
+          use_technical_key: {
+            type: 'boolean',
+            description: 'TAB only. true = technical key (request, data package, record number) instead of the semantic key copied from the template. Default false.',
+          },
+          connection_type: {
+            type: 'string',
+            enum: ['LOCAL', 'SDA', 'DBCON'],
+            description: 'TAB only. LOCAL (default) = BW database; SDA or DBCON need db_connection_name.',
+          },
+          db_connection_name: {
+            type: 'string',
+            description: 'TAB only. Name of the SDA or DBCON connection when connection_type is not LOCAL.',
+          },
+          file_type: {
+            type: 'string',
+            enum: ['CSV', 'FIXED', 'XML'],
+            description: 'FILE only. CSV (default), FIXED (fixed length TXT) or XML.',
+          },
+          file_name: {
+            type: 'string',
+            description: 'FILE only. File name; default is the destination name with the extension of the file type (.CSV, .TXT, .XML).',
+          },
+          separator: {
+            type: 'string',
+            description: 'FILE only, CSV only. One character, default ";".',
+          },
+          file_on_app_server: {
+            type: 'boolean',
+            description: 'FILE only. true = file on the application server (server_name, directory, logical_file_name apply); false (default) = local workstation.',
+          },
+          server_name: {
+            type: 'string',
+            description: 'FILE only. Application server name when file_on_app_server is true.',
+          },
+          logical_file_name: {
+            type: 'string',
+            description: 'FILE only. Logical file name (transaction FILE) instead of file_name; application server only.',
+          },
+          directory: {
+            type: 'string',
+            description: 'FILE only. Directory for a file on the local workstation (required there). On the application server the server always uses its work directory on create.',
+          },
+        },
+        required: ['open_hub_name', 'description', 'info_area', 'template_object_name'],
+      },
+    },
+    {
+      name: 'bw_update_open_hub',
+      description:
+        'Change an Open Hub Destination (TLOGO DEST): description, the database options of a table destination ' +
+        '(write mode, technical key, connection), the file options of a file destination (type, name, separator, ' +
+        'location, directory, logical file name), the semantic key, the external format of fields, the RFC notification, ' +
+        'and the field list (add, remove or rename fields). The rules of the modeling tools apply: a technical key removes the ' +
+        'semantic key and turns overwrite into delete-and-insert; overwrite needs a semantic key. The destination type ' +
+        'itself is not switched. Saved inactive — call bw_activate with object_type "dest" and lock_handle "" afterwards. ' +
+        'Every activation recreates the database table, so it is refused while the table holds data: delete the ' +
+        'requests of the destination first (bw_delete_request, target_type "DEST").',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          open_hub_name: { type: 'string', description: 'Technical name of the Open Hub Destination (e.g. "OBJECT_NAME").' },
+          description: { type: 'string', description: 'New description / label.' },
+          write_mode: { type: 'string', enum: ['INSERT', 'DEL_INSERT', 'OVERWRITE'], description: 'Table only. OVERWRITE needs a semantic key.' },
+          use_technical_key: { type: 'boolean', description: 'Table only. true removes the semantic key (and turns OVERWRITE into DEL_INSERT); false allows key_fields again.' },
+          connection_type: { type: 'string', enum: ['LOCAL', 'SDA', 'DBCON'], description: 'Table only. SDA or DBCON need db_connection_name.' },
+          db_connection_name: { type: 'string', description: 'Table only. Connection name for SDA or DBCON; empty string clears it.' },
+          key_fields: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Table only, without technical key. The complete semantic key in order, by field name as bw_get_open_hub lists it (including any $BIC$ prefix); an empty array clears the key.',
+          },
+          external_format_on: { type: 'array', items: { type: 'string' }, description: 'Fields to switch to external format; output type and length follow the modeling tools (CHAR with the display length, STRG for strings).' },
+          external_format_off: { type: 'array', items: { type: 'string' }, description: 'Fields to switch back to internal format.' },
+          file_type: { type: 'string', enum: ['CSV', 'FIXED', 'XML'], description: 'File only. The file name extension follows (.CSV, .TXT, .XML) unless file_name is given.' },
+          file_name: { type: 'string', description: 'File only.' },
+          separator: { type: 'string', description: 'File only, CSV only. One character.' },
+          file_on_app_server: { type: 'boolean', description: 'File only. false moves the file to the local workstation and drops server name, logical file name and directory (pass directory for the workstation).' },
+          server_name: { type: 'string', description: 'File only, application server only.' },
+          logical_file_name: { type: 'string', description: 'File only, application server only. Logical file name (transaction FILE); an empty string returns to the physical file name.' },
+          directory: { type: 'string', description: 'File only, local workstation only. On the application server the server always uses its work directory.' },
+          send_notification_rfc: { type: 'boolean', description: 'Notify an RFC destination after a load; needs rfc_destination.' },
+          rfc_destination: { type: 'string', description: 'RFC destination for the notification.' },
+          dtp_external_program: { type: 'boolean', description: 'The DTP into this destination is started by an external program.' },
+          fields: {
+            type: 'array',
+            description: 'Fields to add; existing fields are kept. A field bound to an InfoObject takes its type and length.',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', description: 'Field name (uppercase).' },
+                infoobject_name: { type: 'string', description: 'InfoObject to bind the field to (omit for a plain field).' },
+                type: { type: 'string', description: 'Data type (e.g. CHAR, NUMC, DEC, CURR, DATS).' },
+                length: { type: 'number', description: 'Field length.' },
+                label: { type: 'string', description: 'Field label.' },
+                is_key: { type: 'boolean', description: 'Also add the field to the semantic key (table destination without technical key).' },
+              },
+              required: ['name', 'type', 'length', 'label'],
+            },
+          },
+          remove_fields: { type: 'array', items: { type: 'string' }, description: 'Field names to remove, including from the key.' },
+          rename_fields: {
+            type: 'object',
+            additionalProperties: { type: 'string' },
+            description:
+              'Fields to rename, as an object of current field name to new field name. A new name has at most 16 characters, starts with a ' +
+              'letter and consists of letters, digits and underscores. The key keeps the field. A transformation into the destination ' +
+              'loses the rule of a renamed field.',
+          },
+          transport: { type: 'string', description: 'Transport request to record the change on.' },
         },
         required: ['open_hub_name'],
       },
@@ -5929,6 +6326,34 @@ const TOOL_DEFINITIONS = [
       },
     },
     {
+      name: 'bw_restart_process_chain_step',
+      description:
+        'Repeat a failed or canceled step of a process chain run, as the process chain monitor does with "Repeat": ' +
+        'the step runs again as a new instance within the same run (step number n-2, n-3, …), and the chain continues ' +
+        'from there along its success links. Use it after the cause of the failure is removed (a lock released, data ' +
+        'corrected), instead of starting the whole chain again. Without process_id the single failed or canceled step ' +
+        'of the run is repeated; with several, name one. Steps that finished, are running or never ran are refused. ' +
+        'The result names the new instance; follow the run with bw_get_process_chain_run_detail.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chain_id: {
+            type: 'string',
+            description: 'Process chain technical name (e.g. "CHAIN_NAME").',
+          },
+          log_id: {
+            type: 'string',
+            description: 'Log ID of the run, from bw_list_process_chain_runs or bw_list_process_chain_last_status.',
+          },
+          process_id: {
+            type: 'string',
+            description: 'Step number as bw_get_process_chain_run_detail shows it (e.g. "8-1"). Optional when the run has exactly one failed or canceled step.',
+          },
+        },
+        required: ['chain_id', 'log_id'],
+      },
+    },
+    {
       name: 'bw_create_decision_variant',
       description:
         'Create a DECISION process variant (a standalone TLOGO object) for use as a branch/decision step in a Process Chain, via the BW/4HANA Cockpit REST API. ' +
@@ -6551,6 +6976,7 @@ async function handleToolCall(
             uniqueDataRecords: s['unique_data_records'] as boolean | undefined,
             planningMode: s['planning_mode'] as boolean | undefined,
             writeInterface: s['write_interface'] as boolean | undefined,
+            temperatureSchema: s['temperature_schema'] as AdsoSettings['temperatureSchema'],
             label: s['label'] as string | undefined,
           };
           // Remove undefined keys so applied output is clean
@@ -6566,6 +6992,15 @@ async function handleToolCall(
             (args?.key_fields as string[]) ?? [],
             args?.transport as string | undefined
           );
+        } else if (args?.action === 'manage_partitions') {
+          const p = (args?.partitioning ?? {}) as Record<string, unknown>;
+          text = await bwUpdateAdsoPartitions(client, args?.adso_name as string, {
+            field: p['field'] as string | undefined,
+            ranges: p['ranges'] as PartitionSpec['ranges'],
+            dynamic: p['dynamic'] as boolean | undefined,
+            granularity: p['granularity'] as string | undefined,
+            transport: args?.transport as string | undefined,
+          });
         } else if (args?.action === 'add_pure_field') {
           const rawFields = (args?.fields as Array<Record<string, unknown>>) ?? [];
           const fieldDefs: FieldDef[] = rawFields.map((f) => ({
@@ -6628,6 +7063,7 @@ async function handleToolCall(
           aggregation_type: args?.aggregation_type as string | undefined,
           fixed_unit: args?.fixed_unit as string | undefined,
           fixed_currency: args?.fixed_currency as string | undefined,
+          unit_currency_infoobject: args?.unit_currency_infoobject as string | undefined,
           package: args?.package as string | undefined,
           transport: args?.transport as string | undefined,
         });
@@ -6705,6 +7141,20 @@ async function handleToolCall(
           lower_case: args?.lower_case as boolean | undefined,
           fixed_unit: args?.fixed_unit as string | undefined,
           fixed_currency: args?.fixed_currency as string | undefined,
+          unit_currency_infoobject: args?.unit_currency_infoobject as string | undefined,
+          with_master_data: args?.with_master_data as boolean | undefined,
+          with_texts: args?.with_texts as boolean | undefined,
+          short_text: args?.short_text as boolean | undefined,
+          medium_text: args?.medium_text as boolean | undefined,
+          long_text: args?.long_text as boolean | undefined,
+          extra_long_text: args?.extra_long_text as boolean | undefined,
+          texts_language_dependent: args?.texts_language_dependent as boolean | undefined,
+          texts_time_dependent: args?.texts_time_dependent as boolean | undefined,
+          with_hierarchies: args?.with_hierarchies as boolean | undefined,
+          hierarchy_version_dependent: args?.hierarchy_version_dependent as boolean | undefined,
+          hierarchy_time_dependency: args?.hierarchy_time_dependency as 'none' | 'entire_hierarchy' | 'structure' | undefined,
+          hierarchy_intervals: args?.hierarchy_intervals as boolean | undefined,
+          hierarchy_reverse_sign: args?.hierarchy_reverse_sign as boolean | undefined,
           transport: args?.transport as string | undefined,
         });
         break;
@@ -6724,7 +7174,7 @@ async function handleToolCall(
           args?.transformation_name as string,
           args?.source_field as string | undefined,
           args?.target_infoobject as string,
-          (args?.rule_type as 'direct' | 'routine' | 'formula' | 'constant' | 'lookup' | 'no_update' | undefined) ?? 'direct',
+          (args?.rule_type as 'direct' | 'time' | 'routine' | 'formula' | 'constant' | 'lookup' | 'no_update' | undefined) ?? 'direct',
           args?.formula as string | undefined,
           args?.constant_value as string | undefined,
           args?.lookup_object as string | undefined,
@@ -6735,6 +7185,7 @@ async function handleToolCall(
           args?.conversion as RuleConversion | undefined,
           args?.aggregation as string | undefined,
           args?.rule_type !== undefined,
+          args?.lookup_key_mapping as Record<string, string> | undefined,
         );
         break;
 
@@ -6783,6 +7234,15 @@ async function handleToolCall(
           args?.transformation_name as string,
           args?.runtime as 'hana' | 'abap',
           args?.transport as string | undefined
+        );
+        break;
+
+      case 'bw_check':
+        text = await bwCheck(
+          client,
+          args?.object_type as string,
+          args?.object_name as string,
+          args?.source_system as string | undefined
         );
         break;
 
@@ -7027,6 +7487,26 @@ async function handleToolCall(
           filter_clear_fields: args?.filter_clear_fields as string | undefined,
           extraction_mode: args?.extraction_mode as 'full' | 'delta' | undefined,
           semantic_group_fields: args?.semantic_group_fields as string | undefined,
+          package_size: args?.package_size as number | undefined,
+          parallel_extraction: args?.parallel_extraction as boolean | undefined,
+          technical_request_status: args?.technical_request_status as 'green' | 'red' | undefined,
+          overall_request_status: args?.overall_request_status as 'automatic' | 'manual' | undefined,
+          repeat_red_requests_in_process_chain: args?.repeat_red_requests_in_process_chain as boolean | undefined,
+          extract_all_green_requests: args?.extract_all_green_requests as boolean | undefined,
+          retrieve_until_no_more_new_data: args?.retrieve_until_no_more_new_data as boolean | undefined,
+          get_all_new_data_request_by_request: args?.get_all_new_data_request_by_request as boolean | undefined,
+          delta_init_without_data: args?.delta_init_without_data as boolean | undefined,
+          only_retrieve_last_request: args?.only_retrieve_last_request as boolean | undefined,
+          only_get_delta_once: args?.only_get_delta_once as boolean | undefined,
+          request_handling: args?.request_handling as UpdateDtpArgs['request_handling'],
+          number_of_errors_per_package: args?.number_of_errors_per_package as number | undefined,
+          track_records: args?.track_records as boolean | undefined,
+          hana_execution: args?.hana_execution as boolean | undefined,
+          level_of_detail: args?.level_of_detail as UpdateDtpArgs['level_of_detail'],
+          parallel_processes: args?.parallel_processes as number | undefined,
+          batch_class: args?.batch_class as UpdateDtpArgs['batch_class'],
+          server_type: args?.server_type as UpdateDtpArgs['server_type'],
+          server_name: args?.server_name as string | undefined,
           transport: args?.transport as string | undefined,
           transport_lock_holder: args?.transport_lock_holder as string | undefined,
         });
@@ -7601,6 +8081,67 @@ async function handleToolCall(
         text = await bwGetOpenHub(client, args?.open_hub_name as string);
         break;
 
+      case 'bw_create_open_hub': {
+        const options: OpenHubCreateOptions = {
+          description: args?.description as string,
+          infoArea: args?.info_area as string,
+          pkg: args?.package as string | undefined,
+          destinationType: ((args?.destination_type as string | undefined) ?? 'TAB') as OpenHubCreateOptions['destinationType'],
+          templateObjectName: args?.template_object_name as string,
+          templateObjectType: ((args?.template_object_type as string | undefined) ?? 'ADSO') as OpenHubCreateOptions['templateObjectType'],
+          writeMode: args?.write_mode as OpenHubCreateOptions['writeMode'],
+          useTechnicalKey: args?.use_technical_key as boolean | undefined,
+          connectionType: args?.connection_type as OpenHubCreateOptions['connectionType'],
+          dbConnectionName: args?.db_connection_name as string | undefined,
+          fileType: args?.file_type as OpenHubCreateOptions['fileType'],
+          fileName: args?.file_name as string | undefined,
+          separator: args?.separator as string | undefined,
+          fileOnAppServer: args?.file_on_app_server as boolean | undefined,
+          serverName: args?.server_name as string | undefined,
+          logicalFileName: args?.logical_file_name as string | undefined,
+          directory: args?.directory as string | undefined,
+        };
+        text = await bwCreateOpenHub(client, args?.open_hub_name as string, options);
+        break;
+      }
+
+      case 'bw_update_open_hub': {
+        const rawFields = args?.fields as Array<Record<string, unknown>> | undefined;
+        const options: OpenHubUpdateOptions = {
+          description: args?.description as string | undefined,
+          writeMode: args?.write_mode as OpenHubUpdateOptions['writeMode'],
+          useTechnicalKey: args?.use_technical_key as boolean | undefined,
+          connectionType: args?.connection_type as OpenHubUpdateOptions['connectionType'],
+          dbConnectionName: args?.db_connection_name as string | undefined,
+          keyFields: args?.key_fields as string[] | undefined,
+          externalFormatOn: args?.external_format_on as string[] | undefined,
+          externalFormatOff: args?.external_format_off as string[] | undefined,
+          fileType: args?.file_type as OpenHubUpdateOptions['fileType'],
+          fileName: args?.file_name as string | undefined,
+          separator: args?.separator as string | undefined,
+          fileOnAppServer: args?.file_on_app_server as boolean | undefined,
+          serverName: args?.server_name as string | undefined,
+          logicalFileName: args?.logical_file_name as string | undefined,
+          directory: args?.directory as string | undefined,
+          sendNotificationRfc: args?.send_notification_rfc as boolean | undefined,
+          rfcDestination: args?.rfc_destination as string | undefined,
+          dtpExternalProgram: args?.dtp_external_program as boolean | undefined,
+          fields: rawFields?.map((f) => ({
+            name: f['name'] as string,
+            infoObjectName: f['infoobject_name'] as string | undefined,
+            type: f['type'] as string,
+            length: f['length'] as number,
+            label: f['label'] as string,
+            isKey: f['is_key'] as boolean | undefined,
+          })),
+          removeFields: args?.remove_fields as string[] | undefined,
+          renameFields: args?.rename_fields as Record<string, string> | undefined,
+          transport: args?.transport as string | undefined,
+        };
+        text = await bwUpdateOpenHub(client, args?.open_hub_name as string, options);
+        break;
+      }
+
       case 'bw_create_aggregation_level':
         text = await bwCreateAggregationLevel(client, args?.aggregation_level_name as string, {
           label: args?.label as string,
@@ -7798,6 +8339,15 @@ async function handleToolCall(
         text = await bwStartProcessChain(client, args?.name as string, (args?.wait_seconds as number | undefined) ?? 0);
         break;
 
+      case 'bw_restart_process_chain_step':
+        text = await bwRestartProcessChainStep(
+          client,
+          args?.chain_id as string,
+          args?.log_id as string,
+          args?.process_id as string | undefined,
+        );
+        break;
+
       case 'bw_add_process_chain_error_links':
         text = await bwAddProcessChainErrorLinks(client, {
           name: args?.name as string,
@@ -7954,7 +8504,16 @@ function buildInstructions(): string {
     'definitions on this system.',
     '',
     'One BW system per instance: there is no system selector, by design.',
-    ...platformInstructions(cachedPlatform()),
+    ...(toolMode() === 'focused'
+      ? [
+          '',
+          'Focused tool surface: each tool stands for a group of operations selected by its type',
+          'or operation parameter. bw_describe lists them and gives the complete parameter',
+          'definition of one operation.',
+        ]
+      : []),
+    // The platform's routes name full tools; in focused mode the model only sees the focused ones.
+    ...platformInstructions(cachedPlatform()).map((line) => (toolMode() === 'focused' ? translateToolNames(line) : line)),
   ].join('\n');
 }
 
@@ -7984,11 +8543,30 @@ export function createServer(): Server {
     } catch {
       profile = cachedPlatform();
     }
-    return { tools: filterToolsByPlatform(filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo), profile) };
+    const offered = filterToolsByPlatform(filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo), profile);
+    // The focused surface is built from the offered full tools, so whatever the scope or the
+    // platform removes is gone from the focused tools' discriminators too.
+    return { tools: toolMode() === 'focused' ? buildFocusedTools(offered as ToolDefinition[]) : offered };
   });
 
   server.setRequestHandler(CallToolRequestSchema, (request, extra) =>
-    withSessionScope(() => handleToolCall(request, extra)));
+    withSessionScope(async () => {
+      if (toolMode() === 'focused') {
+        const offered = filterToolsByPlatform(
+          filterToolsByScope(TOOL_DEFINITIONS, extra.authInfo),
+          cachedPlatform(),
+        ) as ToolDefinition[];
+        const resolved = resolveFocusedCall(request.params.name, request.params.arguments, offered);
+        if (resolved?.kind === 'describe') return { content: [{ type: 'text' as const, text: resolved.text }] };
+        if (resolved?.kind === 'error') return { content: [{ type: 'text' as const, text: resolved.text }], isError: true };
+        if (resolved?.kind === 'dispatch') {
+          // The full tool's own scope and platform checks apply to the forwarded call.
+          return handleToolCall({ params: { name: resolved.tool, arguments: resolved.arguments } }, extra);
+        }
+      }
+      // A full tool name is answered in either mode: a client holding a list from the other mode keeps working.
+      return handleToolCall(request, extra);
+    }));
 
   return server;
 }
