@@ -2,6 +2,7 @@ import { BwClient } from '../bw-client.js';
 import { ensurePlatform, hiddenTools, parseDiscoveryCollections, parseSysProps } from '../platform.js';
 import { CLASSIC_WRITE_HEADINGS, CLASSIC_WRITE_STATUS, type ClassicWriteVerdict } from '../classic-writes.js';
 import { ensureHelper } from '../helper.js';
+import { readSoftware } from './software.js';
 
 /**
  * Object types this server addresses through the BW modeling REST API, grouped by
@@ -155,6 +156,7 @@ export async function bwSystemProfile(client: BwClient, toolNames: readonly stri
 
   out.push('── System ──');
   out.push(`Platform:        ${isBw4 ? 'SAP BW/4HANA' : 'classic SAP BW (7.5 or lower)'}  [bw.b4hanamode = ${mode || 'n/a'}]`);
+  out.push(`Software:        ${await readSoftware(client)}`);
   out.push(`Verdict from:    ${profile.source}${profile.detected ? '' : ' (detection failed — full tool surface offered)'}`);
   out.push(`Logical system:  ${props['system.logsys'] ?? '?'}`);
   out.push(`Server version:  ${props['system.server_version'] ?? '?'}`);

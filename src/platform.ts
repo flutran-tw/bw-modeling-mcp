@@ -543,6 +543,7 @@ export function platformInstructions(profile: PlatformProfile | undefined): stri
     '  Classic DSOs, InfoCubes, MultiProviders: bw_read_metadata_tables with object_type="ODSO", "CUBE" or "MPRO"',
     '  Analysis processes (nodes, field rules, routines): bw_read_metadata_tables with object_type="ANPR" (a pattern such as "Z*" lists them; bw_search cannot find them)',
     '  InfoPackages (file settings, selections, routines, load history): bw_read_metadata_tables with object_type="ISIP" (or the DataSource name to list them)',
+    '  3.x data flow (update rules, transfer rules, 3.x DataSources and InfoSources): bw_read_metadata_tables with object_type="UPDR", "ISTS", "ISFS" or "ISTD" (a pattern such as "*" lists them with their version; bw_search cannot find them)',
     ...[...routes].map(([topic, call]) => `  ${topic}: ${call}`),
     '',
     'bw_read_metadata_tables reads those objects from the BW metadata tables through the ADT',

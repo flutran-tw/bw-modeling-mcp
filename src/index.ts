@@ -3983,6 +3983,8 @@ const TOOL_DEFINITIONS = [
         'ADSO load history only; ' +
         'ANPR analysis process (nodes, field rules, routine code; "Z*" lists them); ' +
         'ISIP InfoPackage (a DataSource name lists its InfoPackages); ' +
+        '3.x data flow (classic only; "*" lists them with their version): UPDR update rules, ISTS transfer ' +
+        'rules, ISFS 3.x DataSources, ISTD 3.x InfoSources; ' +
         'RSPC process chain definition; RSPCLOG chain runs; ' +
         'PLSE planning function; PLSQ planning sequence; PLCR planning properties; PLDS data slices. ' +
         'Details per type are in the object_type parameter. Prefer the REST tool (bw_get_transformation, ' +
@@ -4017,7 +4019,18 @@ const TOOL_DEFINITIONS = [
               'constants), filters, formulas and routine code; a pattern with * lists the analysis ' +
               'processes, which bw_search cannot find. ' +
               'ISIP: InfoPackage (classic only) — DataSource, file settings, selections with routines, ' +
-              'deletion settings, the process chains using it, load history.',
+              'deletion settings, the process chains using it, load history. ' +
+              'UPDR: 3.x update rules (classic only) — target, InfoSource, key figure rules with update ' +
+              'type, characteristic rules, start routine, global part and rule routines as source code; a ' +
+              'provider name lists the update rules that load it, a pattern with * (on the target) lists ' +
+              'them all with their version — A runs, D is Business Content never installed. ' +
+              'ISTS: 3.x transfer rules — DataSource, InfoSource, field rules and routines; a DataSource ' +
+              'name or a pattern on it lists the DataSource-to-InfoSource assignments. ' +
+              'ISFS: 3.x DataSources (RSOLTPSOURCE) — type, delta, the InfoSource fed, whether migrated to ' +
+              'RSDS; export DataSources (8*) are flagged as generated. ' +
+              'ISTD: 3.x InfoSource — communication structure fields, DataSources and data targets; a ' +
+              'pattern lists them. The 3.x objects are not in the search index; these listings are the ' +
+              'only way to find them.',
           },
           object_name: {
             type: 'string',
@@ -4025,7 +4038,9 @@ const TOOL_DEFINITIONS = [
               'Technical name of the object (for TRFN the UUID-like transformation ID; for PLCR and PLDS the ' +
               'InfoProvider, not the aggregation level; for RSPCLOG a chain name, a run log id, or a ' +
               'pattern such as "Z*" for the last status per chain; for ANPR a process name or a pattern ' +
-              'such as "Z*"; for ISIP the InfoPackage id, or a DataSource name to list its InfoPackages).',
+              'such as "Z*"; for ISIP the InfoPackage id, or a DataSource name to list its InfoPackages; ' +
+              'for UPDR the 25-character update rule id, a provider name or a pattern such as "*"; for ' +
+              'ISTS the transfer structure or a DataSource name; for ISFS and ISTD a name or a pattern).',
           },
         },
         required: ['object_type', 'object_name'],

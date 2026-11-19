@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.0.0~franzz2] - 2026-11-19
+
+- Read the 3.x data flow from its metadata tables through `bw_read_metadata_tables` (`bw_find` operation=metadata_tables), in `src/tools/metadata_3x.ts`. Classic SAP BW only; none of these objects is in the search index:
+  - `UPDR` update rules: target, InfoSource, key figure rules with update and calculation type, characteristic rules (identical sets printed once), global part, start routine and rule routines as ABAP source. A provider name lists the update rules that load it.
+  - `ISTS` transfer rules: DataSource, InfoSource, field rules and routines. A DataSource name lists its DataSource-to-InfoSource assignments.
+  - `ISFS` 3.x DataSources: type, delta, InfoSource fed, whether a 7.x DataSource (RSDS) of the same name exists; export DataSources (`8*`) flagged as generated.
+  - `ISTD` 3.x InfoSources: communication structure fields, DataSources and data targets.
+  - A pattern such as `*` lists each type with the version of every object: `A` runs, `M` is an unactivated change, `D` is Business Content never installed.
+- `bw_system_profile` adds a `Software:` line with the installed SAP_BW / SAP_BASIS (or DW4CORE) release and support package from CVERS, and S4CORE for BW embedded in S/4HANA (`src/tools/software.ts`). `Server version` is the modeling backend number of the systeminfo service, not the SAP_BW release.
+
 ## [2.0.0~franzz1] - 2026-11-13
 
 - Merge upstream v2.0.0 into bw-migration, retaining verified TLS with BW_CA_FILE and stdio scope restrictions.

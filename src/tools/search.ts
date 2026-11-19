@@ -99,6 +99,18 @@ const UNINDEXED_ROUTE: Record<string, string> = {
     'InfoPackages (classic SAP BW only) are not in the search index. List the InfoPackages of a ' +
     'DataSource with bw_read_metadata_tables object_type="ISIP" and the DataSource name, or with ' +
     'bw_xref on the DataSource (object_type="RSDS" with its source_system).',
+  UPDR:
+    'Update rules (3.x, classic SAP BW only) are not in the search index. List them with ' +
+    'bw_read_metadata_tables object_type="UPDR" and a pattern such as "*", or with the target provider name.',
+  ISTS:
+    'Transfer rules (3.x, classic SAP BW only) are not in the search index. List them with ' +
+    'bw_read_metadata_tables object_type="ISTS" and a pattern such as "*" on the DataSource name.',
+  ISFS:
+    '3.x DataSources (classic SAP BW only) are not in the search index. List them with ' +
+    'bw_read_metadata_tables object_type="ISFS" and a pattern such as "*".',
+  ISTD:
+    '3.x InfoSources (classic SAP BW only) are not in the search index. List them with ' +
+    'bw_read_metadata_tables object_type="ISTD" and a pattern such as "*".',
   RSPC:
     'Process chains may be missing from the search index on this release. List them with ' +
     'bw_read_metadata_tables object_type="RSPCLOG" and a pattern such as "Z*" (last status of ' +

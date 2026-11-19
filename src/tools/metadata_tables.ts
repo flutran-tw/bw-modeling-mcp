@@ -24,6 +24,7 @@ import {
 import { readChainLog } from './metadata_chainlog.js';
 import { readAnalysisProcess } from './metadata_apd.js';
 import { readInfoPackage } from './metadata_infopackage.js';
+import { readUpdateRules, readTransferRules, readDataSource3x, readInfoSource3x } from './metadata_3x.js';
 
 /**
  * Read BW object definitions straight from their metadata tables, through the ADT
@@ -1203,7 +1204,7 @@ async function readProcessChain(client: BwClient, chainName: string): Promise<st
 
 // ── Dispatcher ──────────────────────────────────────────────────────────────
 
-const SUPPORTED = ['TRFN', 'DTPA', 'ADSO', 'ODSO', 'CUBE', 'MPRO', 'RSPC', 'PLSE', 'PLSQ', 'PLCR', 'PLDS', 'RSPCLOG', 'ANPR', 'ISIP'];
+const SUPPORTED = ['TRFN', 'DTPA', 'ADSO', 'ODSO', 'CUBE', 'MPRO', 'RSPC', 'PLSE', 'PLSQ', 'PLCR', 'PLDS', 'RSPCLOG', 'ANPR', 'ISIP', 'UPDR', 'ISTS', 'ISFS', 'ISTD'];
 
 /**
  * Width of the key column each type is looked up by. A name wider than its column does not
@@ -1231,6 +1232,14 @@ const NAME_WIDTHS: Record<string, number> = {
   ANPR: 30,
   // RSLDPIO-LOGDPID and -OLTPSOURCE, since a DataSource name is accepted too.
   ISIP: 30,
+  // 3.x data flow: RSUPDINFO-UPDID is CHAR(25), but a provider name (30) lists its update
+  // rules; RSTS-TRANSTRU is CHAR(27), but a DataSource name (30) is accepted too.
+  UPDR: 30,
+  ISTS: 30,
+  ISFS: 30,
+  ISTD: 30,
+  ISMD: 30,
+  ISCS: 30,
 };
 
 /**
@@ -1286,6 +1295,17 @@ export async function bwReadMetadataTables(
       return readAnalysisProcess(client, objectName.trim());
     case 'ISIP':
       return readInfoPackage(client, objectName.trim());
+    case 'UPDR':
+      return readUpdateRules(client, objectName.trim());
+    case 'ISTS':
+    case 'ISMP':
+      return readTransferRules(client, objectName.trim());
+    case 'ISFS':
+      return readDataSource3x(client, objectName.trim());
+    case 'ISTD':
+    case 'ISMD':
+    case 'ISCS':
+      return readInfoSource3x(client, objectName.trim());
     default:
       return (
         `Object type "${objectType}" is not supported yet. Supported: ${SUPPORTED.join(', ')}.`
