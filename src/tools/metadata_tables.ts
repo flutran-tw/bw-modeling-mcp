@@ -22,6 +22,7 @@ import {
   readDataSlices,
 } from './metadata_planning.js';
 import { readChainLog } from './metadata_chainlog.js';
+import { readRecordCount } from './metadata_records.js';
 import { readAnalysisProcess } from './metadata_apd.js';
 import { readInfoPackage } from './metadata_infopackage.js';
 import { readUpdateRules, readTransferRules, readDataSource3x, readInfoSource3x } from './metadata_3x.js';
@@ -1204,7 +1205,7 @@ async function readProcessChain(client: BwClient, chainName: string): Promise<st
 
 // ── Dispatcher ──────────────────────────────────────────────────────────────
 
-const SUPPORTED = ['TRFN', 'DTPA', 'ADSO', 'ODSO', 'CUBE', 'MPRO', 'RSPC', 'PLSE', 'PLSQ', 'PLCR', 'PLDS', 'RSPCLOG', 'ANPR', 'ISIP', 'UPDR', 'ISTS', 'ISFS', 'ISTD'];
+const SUPPORTED = ['TRFN', 'DTPA', 'ADSO', 'ODSO', 'CUBE', 'MPRO', 'RSPC', 'PLSE', 'PLSQ', 'PLCR', 'PLDS', 'RSPCLOG', 'ANPR', 'ISIP', 'UPDR', 'ISTS', 'ISFS', 'ISTD', 'RECORDS'];
 
 /**
  * Width of the key column each type is looked up by. A name wider than its column does not
@@ -1267,6 +1268,8 @@ export async function bwReadMetadataTables(
   }
 
   switch (type) {
+    case 'RECORDS':
+      return readRecordCount(client, name);
     case 'TRFN':
       return readTransformation(client, objectName.trim());
     case 'DTPA':
