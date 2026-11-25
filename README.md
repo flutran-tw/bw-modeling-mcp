@@ -206,7 +206,7 @@ The ADT MCP server covers ABAP as a subject in its own right: your own reports, 
 npm install -g bw-modeling-mcp
 
 # Option 2: Clone and build
-git clone https://github.com/dnic-dev/bw-modeling-mcp.git
+git clone --branch bw-migration git@github.com:flutran-tw/bw-modeling-mcp.git
 cd bw-modeling-mcp
 npm install
 npm run build
