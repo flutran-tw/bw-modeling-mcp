@@ -23,6 +23,7 @@ import {
 } from './metadata_planning.js';
 import { readChainLog } from './metadata_chainlog.js';
 import { readRecordCount } from './metadata_records.js';
+import { readQueryMasterDataUsage } from './metadata_query_usage.js';
 import { readAnalysisProcess } from './metadata_apd.js';
 import { readInfoPackage } from './metadata_infopackage.js';
 import { readUpdateRules, readTransferRules, readDataSource3x, readInfoSource3x } from './metadata_3x.js';
@@ -1205,7 +1206,7 @@ async function readProcessChain(client: BwClient, chainName: string): Promise<st
 
 // ── Dispatcher ──────────────────────────────────────────────────────────────
 
-const SUPPORTED = ['TRFN', 'DTPA', 'ADSO', 'ODSO', 'CUBE', 'MPRO', 'RSPC', 'PLSE', 'PLSQ', 'PLCR', 'PLDS', 'RSPCLOG', 'ANPR', 'ISIP', 'UPDR', 'ISTS', 'ISFS', 'ISTD', 'RECORDS'];
+const SUPPORTED = ['TRFN', 'DTPA', 'ADSO', 'ODSO', 'CUBE', 'MPRO', 'RSPC', 'PLSE', 'PLSQ', 'PLCR', 'PLDS', 'RSPCLOG', 'ANPR', 'ISIP', 'UPDR', 'ISTS', 'ISFS', 'ISTD', 'RECORDS', 'QUSE'];
 
 /**
  * Width of the key column each type is looked up by. A name wider than its column does not
@@ -1241,6 +1242,7 @@ const NAME_WIDTHS: Record<string, number> = {
   ISTD: 30,
   ISMD: 30,
   ISCS: 30,
+  QUSE: 30,
 };
 
 /**
@@ -1270,6 +1272,8 @@ export async function bwReadMetadataTables(
   switch (type) {
     case 'RECORDS':
       return readRecordCount(client, name);
+    case 'QUSE':
+      return readQueryMasterDataUsage(client, name);
     case 'TRFN':
       return readTransformation(client, objectName.trim());
     case 'DTPA':
