@@ -1,13 +1,13 @@
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import http from 'http';
 import https from 'https';
-import tls from 'tls';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import * as fs from 'fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { currentClient } from './request-context.js';
 // Value import, but no cycle at runtime: platform.ts takes BwClient as a type only.
 import { cachedPlatform } from './platform.js';
+import { assertBackendPath } from './request-path.js';
 
 const ECLIPSE_USER_AGENT =
   'Eclipse/4.38.0.v20251201-0920 (win32; x86_64; Java 21.0.9) ADT/3.56.0 (devedition)';
@@ -312,15 +312,66 @@ function tracksLock(type: string): boolean {
 }
 
 /**
- * Server certificates are verified against Node's built-in roots plus the PEM bundle in
- * BW_CA_FILE, for a company CA that signs the BW host's certificate. BW_TLS_INSECURE=true
- * turns verification off again, for systems with a self-signed certificate.
+ * The server certificate is verified unless BW_TLS_VERIFY says otherwise.
+ *
+ * Without verification anyone on the network path can answer as the BW system and collect the
+ * credentials and session of whoever connects. A system whose certificate comes from an
+ * in-house authority is covered by handing that authority to Node (NODE_EXTRA_CA_CERTS), which
+ * keeps the check. Switching it off is for a system with a self-signed certificate and has to
+ * be asked for.
  */
-function tlsOptions(): https.AgentOptions {
-  if (process.env.BW_TLS_INSECURE?.trim().toLowerCase() === 'true') return { rejectUnauthorized: false };
-  const caFile = process.env.BW_CA_FILE?.trim();
-  if (!caFile) return { rejectUnauthorized: true };
-  return { rejectUnauthorized: true, ca: [...tls.rootCertificates, fs.readFileSync(caFile, 'utf8')] };
+export function tlsVerifyEnabled(env: NodeJS.ProcessEnv): boolean {
+  return !/^(off|false|0|no)$/i.test((env.BW_TLS_VERIFY ?? '').trim());
+}
+
+const TLS_VERIFY = tlsVerifyEnabled(process.env);
+if (!TLS_VERIFY) {
+  process.stderr.write(
+    '[warn] BW_TLS_VERIFY=off: the certificate of the BW system is not verified. ' +
+      'Prefer NODE_EXTRA_CA_CERTS with the certificate authority of the system.\n',
+  );
+}
+
+const CERTIFICATE_ERRORS: Record<string, string> = {
+  SELF_SIGNED_CERT_IN_CHAIN: 'it is signed by a certificate authority this machine does not trust',
+  UNABLE_TO_GET_ISSUER_CERT: 'it is signed by a certificate authority this machine does not trust',
+  UNABLE_TO_GET_ISSUER_CERT_LOCALLY: 'it is signed by a certificate authority this machine does not trust',
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE: 'it is signed by a certificate authority this machine does not trust',
+  DEPTH_ZERO_SELF_SIGNED_CERT: 'it is self-signed',
+  CERT_HAS_EXPIRED: 'it has expired',
+  CERT_NOT_YET_VALID: 'it is not valid yet',
+  ERR_TLS_CERT_ALTNAME_INVALID: 'it was issued for a different host name than the one in BW_URL',
+};
+
+/**
+ * The message for a request that failed on the server certificate, or undefined for any other
+ * failure. The raw error is a bare code that says neither what was refused nor what to do.
+ */
+export function certificateFailure(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | null)?.code;
+  const reason = typeof code === 'string' ? CERTIFICATE_ERRORS[code] : undefined;
+  if (!reason) return undefined;
+  return (
+    `The certificate of the BW system was refused: ${reason} (${code}). ` +
+    'If it comes from an in-house certificate authority, point NODE_EXTRA_CA_CERTS at a PEM file with that authority. ' +
+    'For a system with a self-signed certificate, BW_TLS_VERIFY=off switches the check off.'
+  );
+}
+
+/** A cookie value as it may appear in a log: enough to tell two values apart, not enough to use. */
+export function maskCookieValue(value: string): string {
+  if (value === '') return '';
+  return `<${value.length} chars, sha256 ${createHash('sha256').update(value).digest('hex').slice(0, 8)}>`;
+}
+
+/** A Set-Cookie header with its value masked; the name and the attributes stay readable. */
+export function maskSetCookie(header: string): string {
+  const end = header.indexOf(';');
+  const pair = end === -1 ? header : header.slice(0, end);
+  const rest = end === -1 ? '' : header.slice(end);
+  const eq = pair.indexOf('=');
+  if (eq <= 0) return header;
+  return `${pair.slice(0, eq)}=${maskCookieValue(pair.slice(eq + 1).trim())}${rest}`;
 }
 
 /**
@@ -330,7 +381,7 @@ function tlsOptions(): https.AgentOptions {
  * clients can share sockets. Idle sockets are closed after 30 s, far below the ICM's own idle
  * limit (300 s measured), so a request is never sent on a socket the server is closing.
  */
-const sharedHttpsAgent = new https.Agent({ ...tlsOptions(), keepAlive: true, timeout: 30_000 });
+const sharedHttpsAgent = new https.Agent({ rejectUnauthorized: TLS_VERIFY, keepAlive: true, timeout: 30_000 });
 
 /**
  * Behind the Cloud Connector proxy no connection is reused. The connectivity proxy ties a
@@ -340,7 +391,7 @@ const sharedHttpsAgent = new https.Agent({ ...tlsOptions(), keepAlive: true, tim
  * principals on one socket. The proxy runs next to the app, so a new connection costs little.
  */
 const proxyHttpAgent = new http.Agent({ keepAlive: false });
-const proxyHttpsAgent = new https.Agent({ ...tlsOptions(), keepAlive: false });
+const proxyHttpsAgent = new https.Agent({ rejectUnauthorized: TLS_VERIFY, keepAlive: false });
 
 function agentsFor(proxied: boolean): { httpAgent?: http.Agent; httpsAgent: https.Agent } {
   return proxied
@@ -491,6 +542,14 @@ export class BwClient {
       ...agentsFor(!!opts.proxy),
       validateStatus: () => true,
     });
+    this.http.interceptors.response.use(undefined, (error: unknown) => {
+      const refused = certificateFailure(error);
+      return Promise.reject(refused ? new Error(refused, { cause: error }) : error);
+    });
+    this.http.interceptors.request.use((config) => {
+      assertBackendPath(config.url, config.baseURL);
+      return config;
+    });
     delete this.http.defaults.headers.post['Content-Type'];
     delete (this.http.defaults.headers as any).common['Content-Type'];
 
@@ -639,8 +698,18 @@ export class BwClient {
   // ── Session info (debug) ──────────────────────────────────────────────────
 
   /** Returns a snapshot of the current session cookies — for debug assertions only. */
+  /** The address this client sends its requests to. */
+  public get baseUrl(): string {
+    return this.opts.url;
+  }
+
   public sessionInfo(): Record<string, string> {
     return Object.fromEntries(this.cookies.entries());
+  }
+
+  /** The cookie jar for a diagnostic log: names in full, values masked. */
+  public maskedSessionInfo(): Record<string, string> {
+    return Object.fromEntries([...this.cookies.entries()].map(([k, v]) => [k, maskCookieValue(v)]));
   }
 
   // ── Cookie management ──────────────────────────────────────────────────────
@@ -657,7 +726,7 @@ export class BwClient {
     const setCookies = response.headers['set-cookie'];
     if (!setCookies) return;
     if (this.sessionDebug) {
-      console.error(`[bw-session] Set-Cookie received: ${JSON.stringify(setCookies)}`);
+      console.error(`[bw-session] Set-Cookie received: ${JSON.stringify(setCookies.map(maskSetCookie))}`);
     }
     for (const c of setCookies) {
       const attrs = c.split(';');
@@ -678,7 +747,7 @@ export class BwClient {
       this.cookies.set(name, value);
     }
     if (this.sessionDebug) {
-      console.error(`[bw-session] cookie jar now: ${JSON.stringify(Object.fromEntries(this.cookies.entries()))}`);
+      console.error(`[bw-session] cookie jar now: ${JSON.stringify(this.maskedSessionInfo())}`);
     }
   }
 

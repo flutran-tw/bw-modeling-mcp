@@ -1,4 +1,4 @@
-import { BwClient, bwSeg } from '../bw-client.js';
+import { BwClient, bwSeg, maskSetCookie } from '../bw-client.js';
 
 const BASE = '/sap/bc/http/sap/bw4/v1/modeling/processchains';
 const DECISION_VARIANTS_BASE = '/sap/bc/http/sap/bw4/v1/modeling/processtypes/decision/variants';
@@ -181,6 +181,11 @@ export interface CreateProcessChainParams {
   activate?: boolean;
   // Optional event start-condition for the trigger. Omit for the default immediate start.
   triggerEvent?: TriggerEventConfig;
+  // Target package; $TMP when omitted.
+  package?: string;
+  // Transport request for a transportable package (required unless exactly one
+  // changeable request is available).
+  transportRequest?: string;
 }
 
 export interface UpdateProcessChainParams {
@@ -344,6 +349,24 @@ export interface AddProcessChainProgramParams {
   transportRequest?: string;
 }
 
+export interface AddProcessChainDecisionParams {
+  name: string;
+  // Existing, active decision variant the step references.
+  variant: string;
+  description?: string;
+  // Placement: exactly one of these.
+  before?: string;
+  after?: string;
+  // Branch on which the existing strand continues. Default "then".
+  continueOn?: 'then' | 'else';
+  // Existing step the other branch leads to.
+  otherBranchTo: string;
+  // Edges INTO the decision ('after'). Branch edges are always positive.
+  edgeMode?: 'both' | 'success_only';
+  activate?: boolean;
+  transportRequest?: string;
+}
+
 export interface AddProcessChainPlanningSwitchParams {
   name: string;
   // "load" adds a PLSWITCHL step (switch to load mode), "plan" a PLSWITCHP step (switch back
@@ -418,7 +441,7 @@ async function resolveTransportHeader(
   // BW_DEBUG_SESSION) so a failing sequence can be compared to a working one.
   const callValidate = async (token: string) => {
     if (debug) {
-      console.error(`[bw-session] validateobject uri=${uri} outgoing cookies: ${JSON.stringify(client.sessionInfo())}`);
+      console.error(`[bw-session] validateobject uri=${uri} outgoing cookies: ${JSON.stringify(client.maskedSessionInfo())}`);
     }
     const res = await client.rawPost(
       VALIDATEOBJECT_PATH,
@@ -426,7 +449,7 @@ async function resolveTransportHeader(
       writeHeaders(token)
     );
     if (debug) {
-      console.error(`[bw-session] validateobject uri=${uri} incoming Set-Cookie: ${JSON.stringify((res.headers as Record<string, unknown>)['set-cookie'] ?? null)}`);
+      console.error(`[bw-session] validateobject uri=${uri} incoming Set-Cookie: ${JSON.stringify(((res.headers as Record<string, unknown>)['set-cookie'] as string[] | undefined)?.map(maskSetCookie) ?? null)}`);
     }
     return res;
   };
@@ -1185,8 +1208,9 @@ export async function bwCreateProcessChain(
   client: BwClient,
   params: CreateProcessChainParams
 ): Promise<string> {
-  const { name, infoarea, description, steps, edges, activate = false, triggerEvent } = params;
+  const { name, infoarea, description, steps, edges, activate = false, triggerEvent, transportRequest } = params;
   const nameLc = name.toLowerCase();
+  const pkg = (params.package?.trim() || '$TMP').toUpperCase();
 
   const { stepNodes, aEdge, stepInlineVariants } = buildModelParts(steps, edges);
 
@@ -1208,21 +1232,30 @@ export async function bwCreateProcessChain(
   // did not match (known intermittent SAP behaviour). Transport rules are still
   // enforced by the actual POST in Step 2, so we warn and continue rather than abort.
   let transportWarning: string | undefined;
+  let transportHeader: Record<string, string> = {};
   const csrf1 = await client.getCsrfToken();
-  await client
-    .rawPost(
-      '/sap/bc/http/sap/bw4/v1/modeling/transports/validateobject',
-      JSON.stringify({ uri: `${BASE}/${nameLc}`, package: '$TMP' }),
-      writeHeaders(csrf1)
-    )
-    .catch((err: Error) => {
-      if (/HTTP 404/.test(err.message)) {
-        transportWarning = 'Transport pre-check returned 404 (validateobject); transport rules still apply on save.';
-      } else {
+  if (pkg === '$TMP') {
+    await client
+      .rawPost(VALIDATEOBJECT_PATH, JSON.stringify({ uri: `${BASE}/${nameLc}`, package: '$TMP' }), writeHeaders(csrf1))
+      .catch((err: Error) => {
+        if (/HTTP 404/.test(err.message)) {
+          transportWarning = 'Transport pre-check returned 404 (validateobject); transport rules still apply on save.';
+        } else {
+          throw new Error(`Transport check (create): ${err.message}`);
+        }
+      });
+  } else {
+    const resolved = await resolveTransportHeader(client, `${BASE}/${nameLc}`, csrf1, transportRequest, pkg).catch(
+      (err: Error) => {
         throw new Error(`Transport check (create): ${err.message}`);
-      }
-    });
+      },
+    );
+    transportHeader = resolved.header;
+    transportWarning = resolved.warning;
+  }
   refreshCsrf(client);
+  // The create takes its package from this header and files the chain under $TMP without it.
+  const createHeaders = { ...transportHeader, ...(pkg !== '$TMP' ? { 'sap-bw4-developmentclass': pkg } : {}) };
 
   // ── Step 2: Create chain with trigger-only skeleton ────────────────────────
   const csrf2 = await client.getCsrfToken();
@@ -1238,7 +1271,7 @@ export async function bwCreateProcessChain(
           oHeader: oHeaderCreate,
         },
       }),
-      writeHeaders(csrf2)
+      { ...writeHeaders(csrf2), ...createHeaders }
     )
     .catch((err: Error) => {
       throw new Error(`Create chain: ${err.message}`);
@@ -1248,8 +1281,11 @@ export async function bwCreateProcessChain(
   // ── Step 3: GET chain for ETag and server-assigned trigger variant key ─────
   let etag: string;
   let triggerVariantKey: string;
+  let actualPackage: string | null = null;
   try {
     const got = await client.rawGet(`${BASE}/${nameLc}`, { Accept: JSON_CT });
+    const reported = got.headers['sap-bw4-developmentclass'];
+    if (typeof reported === 'string' && reported) actualPackage = reported.toUpperCase();
     etag = got.headers['etag'] as string;
     if (!etag) throw new Error('No ETag returned by GET after create');
     const getBody = JSON.parse(got.body);
@@ -1290,6 +1326,7 @@ export async function bwCreateProcessChain(
       'x-csrf-token': csrf4,
       'If-Match': etag,
       'X-Requested-With': 'XMLHttpRequest',
+      ...transportHeader,
     })
     .catch((err: Error) => {
       throw new Error(`PUT full model: ${err.message}`);
@@ -1299,11 +1336,19 @@ export async function bwCreateProcessChain(
   // ── Step 6: Optional activation ───────────────────────────────────────────
   const result: Record<string, unknown> = {
     chain: name,
+    package: actualPackage ?? pkg,
+    packageVerified: actualPackage !== null,
     nodes: 1 + stepNodes.length,
     edges: aEdge.length,
     activated: activate,
   };
+  if (transportHeader['sap-bw4-transportRequest']) result.transportRequest = transportHeader['sap-bw4-transportRequest'];
   if (transportWarning) result.transportWarning = transportWarning;
+  if (actualPackage !== null && actualPackage !== pkg) {
+    result.packageWarning =
+      `Package '${pkg}' was requested but the chain is in '${actualPackage}'. ` +
+      `Reassign it with bw_change_package (object_type "RSPC").`;
+  }
   if (activate) {
     attachActivation(result, await activateChain(client, nameLc));
   }
@@ -1454,9 +1499,11 @@ export async function bwActivateProcessChain(client: BwClient, name: string): Pr
 // create POST is therefore always followed by an activate POST.
 //
 // Transport vs. visibility: $TMP is fine for visibility/selection; a transportable
-// package is only needed to transport the variant. When a non-$TMP package is passed,
-// validateobject declares it and the transport request is supplied as the
-// sap-bw4-transportRequest header on the create POST (same mechanism as a chain write).
+// package is only needed to transport the variant. validateobject only validates the
+// package and lists the assignable requests; the create POST takes the package from the
+// sap-bw4-developmentclass header and the request from sap-bw4-transportRequest, and files
+// the variant under $TMP when the package header is missing. The GET on the variant
+// returns the package in the same header, which is what the result reports.
 
 export async function bwCreateDecisionVariant(
   client: BwClient,
@@ -1537,6 +1584,9 @@ export async function bwCreateDecisionVariant(
     .rawPost(DECISION_VARIANTS_BASE, JSON.stringify({ name: nameUpper, model }), {
       ...writeHeaders(postCsrf),
       ...transportHeader,
+      // validateobject only validates; the create takes its package from this header and
+      // falls back to $TMP without it.
+      ...(pkg !== '$TMP' ? { 'sap-bw4-developmentclass': pkg } : {}),
     })
     .catch((err: Error) => {
       throw new Error(`Create decision variant '${nameUpper}': ${err.message}`);
@@ -1558,21 +1608,43 @@ export async function bwCreateDecisionVariant(
   refreshCsrf(client);
   const activation = parseActivateResponse(actRes.body);
 
+  // ── Step 4: Read the package back ──────────────────────────────────────────
+  // The create accepts a request without complaint and still files the variant under
+  // $TMP when the package did not reach it, so report what the object directory says.
+  let actualPackage: string | null = null;
+  try {
+    const got = await client.rawGet(uri, { Accept: JSON_CT });
+    const reported = got.headers['sap-bw4-developmentclass'];
+    if (typeof reported === 'string' && reported) actualPackage = reported.toUpperCase();
+  } catch {
+    // Left unverified; the result says so.
+  }
+  const packageMismatch = actualPackage !== null && actualPackage !== pkg;
+
   const result: Record<string, unknown> = {
     variant: nameUpper,
     description,
-    package: pkg,
+    package: actualPackage ?? pkg,
+    packageVerified: actualPackage !== null,
     branches: [
       { eventNo: thenEventNo, label: thenLabel, formula },
       { eventNo: elseEventNo, label: elseLabel },
     ],
     message:
-      `Decision variant '${nameUpper}' created and activated in package '${pkg}'. ` +
+      `Decision variant '${nameUpper}' created and activated in package '${actualPackage ?? pkg}'` +
+      `${actualPackage === null ? ' (requested; the package could not be read back)' : ''}. ` +
       `Reference it from a chain DECISION step (variant='${nameUpper}') and branch its ` +
       `edges with sub_status '${thenEventNo}' (${thenLabel}) / '${elseEventNo}' (${elseLabel}).`,
   };
   attachActivation(result, activation);
   if (transportWarning) result.transportWarning = transportWarning;
+  if (packageMismatch) {
+    result.packageRequested = pkg;
+    result.packageWarning =
+      `Package '${pkg}' was requested but the variant is in '${actualPackage}'. It will not be ` +
+      `transported with a chain that references it. Reassign it with bw_change_package ` +
+      `(object_type "RSPV", object_name "DECISION" padded to 10 characters followed by the variant name).`;
+  }
   if (pkg === '$TMP') {
     result.transportNote =
       `Variant created in $TMP. $TMP is fine for visibility/selection in the picker; ` +
@@ -2117,6 +2189,174 @@ export async function bwAddProcessChainProgram(
         report: {
           added: `ABAP program ${progU}${varU ? ` (variant ${varU})` : ''}`,
           placement,
+        },
+      };
+    },
+    { activate, transportRequest }
+  );
+
+  return JSON.stringify(result, null, 2);
+}
+
+// ── bw_add_process_chain_decision ──────────────────────────────────────────────
+//
+// Add a DECISION step in place. The step references an existing decision variant
+// (bIsReference:true), so nothing but the node and its edges is added. A decision has no
+// plain successor: every edge leaving it is a branch edge, positive with the branch's
+// EVENTNO as sub-status. The existing strand therefore continues on exactly one branch
+// (`continueOn`). The chain check refuses a decision with a branch that leads nowhere, so
+// the other branch must lead to an existing step as well.
+
+// Branch EVENTNOs of a decision variant in branch order (THEN, ELSE), read from the variant
+// itself so the edges match what the variant defines rather than an assumed "01"/"02".
+async function readDecisionBranches(
+  client: BwClient,
+  variant: string
+): Promise<{ thenEventNo: string; elseEventNo: string; description: string }> {
+  let body: string;
+  try {
+    body = (await client.rawGet(`${DECISION_VARIANTS_BASE}/${variant.toLowerCase()}`, { Accept: JSON_CT })).body;
+  } catch (err: any) {
+    throw new Error(
+      `Decision variant '${variant}' could not be read (${err.message}). ` +
+      `Create it first with bw_create_decision_variant.`
+    );
+  }
+  const root = JSON.parse(body);
+  const model = root.model ?? root;
+  const values: any[] =
+    (model.oDetail ?? []).find((d: any) => String(d.field).toUpperCase() === 'EVENTNO')?.values ?? [];
+  const byBranch = (n: number) =>
+    String(values.find((v: any) => Number(v.high) === n)?.low ?? '').trim();
+  return {
+    thenEventNo: byBranch(1) || '01',
+    elseEventNo: byBranch(2) || '02',
+    description: String(model.sVariantDescription ?? ''),
+  };
+}
+
+export async function bwAddProcessChainDecision(
+  client: BwClient,
+  params: AddProcessChainDecisionParams
+): Promise<string> {
+  const {
+    name, variant, before, after, continueOn = 'then', otherBranchTo,
+    edgeMode = 'both', activate = false, transportRequest,
+  } = params;
+  const variantU = variant.toUpperCase();
+
+  if ([before, after].filter(Boolean).length !== 1) {
+    throw new Error("Pass exactly one of 'before' or 'after' to place the decision step.");
+  }
+  if (!otherBranchTo) {
+    throw new Error(
+      "'other_branch_to' is required: the chain check refuses a decision with a branch that has no successor."
+    );
+  }
+
+  const branches = await readDecisionBranches(client, variantU);
+  const continueNo = continueOn === 'then' ? branches.thenEventNo : branches.elseEventNo;
+  const otherNo = continueOn === 'then' ? branches.elseEventNo : branches.thenEventNo;
+
+  const { result } = await editChainModel(
+    client,
+    name,
+    (model) => {
+      const nodes: any[] = model.aNode;
+
+      if (nodes.some((n) =>
+        String(n.sProcessType ?? '').toUpperCase() === 'DECISION' &&
+        String(n.sProcessVariant ?? '').toUpperCase() === variantU
+      )) {
+        return { report: {}, skipReason: `DECISION step for variant '${variantU}' already present` };
+      }
+
+      // Resolve every reference against the model as read, before the new node exists.
+      const targetIdx = resolveChainNodeRef(
+        model,
+        (before ?? after)!,
+        before ? "'before' target" : "'after' target"
+      );
+      const otherIdx = resolveChainNodeRef(model, otherBranchTo, "'other_branch_to' target");
+      const targetLabel = chainNodeLabel(model, targetIdx);
+
+      const decIdx = nodes.length;
+      nodes.push({
+        sProcessType: 'DECISION',
+        bIsReference: true,
+        sProcessVariant: variantU,
+        sVariantDescription: params.description ?? branches.description,
+        iAutoRepeatWaitDuration: 0,
+      });
+
+      const linkInto = (from: number) => {
+        addChainEdge(model, from, decIdx, defaultStatusForNode(model, from));
+        if (edgeMode !== 'success_only' && defaultStatusForNode(model, from) === 'positive') {
+          addChainEdge(model, from, decIdx, 'negative');
+        }
+      };
+      const continued: string[] = [];
+      let placement: string;
+
+      if (before) {
+        let rerouted = 0;
+        for (const e of model.aEdge as any[]) {
+          if (e.iNodeIndexTo === targetIdx && e.iNodeIndexFrom !== decIdx) {
+            e.iNodeIndexTo = decIdx;
+            rerouted++;
+          }
+        }
+        if (rerouted === 0) {
+          throw new Error(
+            `'before' target ${targetLabel} has no incoming edge to reroute — ` +
+            `nothing can be inserted ahead of a node that nothing leads to.`
+          );
+        }
+        addChainEdge(model, decIdx, targetIdx, 'positive', continueNo);
+        continued.push(targetLabel);
+        placement = `in series before ${targetLabel}`;
+      } else {
+        const targetType = String(nodes[targetIdx].sProcessType ?? '').toUpperCase();
+        if (targetType === 'DECISION') {
+          throw new Error(
+            `'after' target ${targetLabel} is itself a decision; its branches lead to different steps. ` +
+            `Use 'before' with the step the new decision should guard.`
+          );
+        }
+        // Successors reached on success (or unconditionally) move behind the decision.
+        // A step reached only on error is an error handler of the target and stays there.
+        const out = (model.aEdge as any[]).filter((e) => e.iNodeIndexFrom === targetIdx);
+        const moved = [...new Set(
+          out.filter((e) => e.sStatus !== 'negative').map((e) => e.iNodeIndexTo as number)
+        )];
+        if (moved.length === 0) {
+          throw new Error(
+            `'after' target ${targetLabel} has no successor for the '${continueOn}' branch to continue with. ` +
+            `Add the step that branch should lead to first, or use 'before' on an existing step.`
+          );
+        }
+        model.aEdge = (model.aEdge as any[]).filter(
+          (e) => !(e.iNodeIndexFrom === targetIdx && moved.includes(e.iNodeIndexTo))
+        );
+        linkInto(targetIdx);
+        for (const succ of moved) {
+          addChainEdge(model, decIdx, succ, 'positive', continueNo);
+          continued.push(chainNodeLabel(model, succ));
+        }
+        placement = `in series after ${targetLabel}`;
+      }
+
+      addChainEdge(model, decIdx, otherIdx, 'positive', otherNo);
+      const otherLabel = chainNodeLabel(model, otherIdx);
+
+      return {
+        report: {
+          added: `DECISION ${variantU}`,
+          placement,
+          branches: {
+            [continueOn]: { eventNo: continueNo, to: continued },
+            [continueOn === 'then' ? 'else' : 'then']: { eventNo: otherNo, to: [otherLabel] },
+          },
         },
       };
     },

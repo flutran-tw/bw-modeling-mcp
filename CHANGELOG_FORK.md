@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.1.0~franzz1] - 2026-11-25
+
+- Merge upstream v2.1.0 into bw-migration.
+- Drop our own TLS handling (`BW_CA_FILE`, `BW_TLS_INSECURE`): upstream now verifies the certificate by default, takes an in-house CA as a PEM file through `NODE_EXTRA_CA_CERTS`, and switches the check off with `BW_TLS_VERIFY=off`. `start-bw-mcp.mjs` sets `NODE_EXTRA_CA_CERTS` to `rootca.pem` and restarts itself, since Node reads that variable only at startup.
+
 ## [2.0.0~franzz2] - 2026-11-19
 
 - Read the 3.x data flow from its metadata tables through `bw_read_metadata_tables` (`bw_find` operation=metadata_tables), in `src/tools/metadata_3x.ts`. Classic SAP BW only; none of these objects is in the search index:

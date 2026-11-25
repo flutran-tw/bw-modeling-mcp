@@ -1,8 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import test from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -88,21 +86,7 @@ test('TLS certificate verification remains enabled by default', () => {
   assert.equal(tlsProbe().verify, true);
 });
 
-test('custom BW CA augments trusted roots without disabling verification', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bw-ca-test-'));
-  try {
-    const ca = path.join(tmp, 'ca.pem');
-    fs.writeFileSync(ca, 'TEST-CA');
-    const result = tlsProbe({ BW_CA_FILE: ca });
-    assert.equal(result.verify, true);
-    assert.equal(result.custom, true);
-    assert.ok(result.count > 1);
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-test('insecure TLS requires the explicit opt-in flag', () => {
-  assert.equal(tlsProbe({ BW_TLS_INSECURE: 'true' }).verify, false);
-  assert.equal(tlsProbe({ BW_TLS_INSECURE: 'false' }).verify, true);
+test('disabling TLS verification requires the explicit upstream opt-out', () => {
+  assert.equal(tlsProbe({ BW_TLS_VERIFY: 'off' }).verify, false);
+  assert.equal(tlsProbe({ BW_TLS_VERIFY: 'on' }).verify, true);
 });

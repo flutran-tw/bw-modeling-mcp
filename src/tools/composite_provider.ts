@@ -7,6 +7,29 @@ import {
   bwSegUpper,
   stripInfoAreaSentinel,
 } from '../bw-client.js';
+import {
+  NodeKind,
+  addJoinPartner,
+  describeNodes,
+  enterScope,
+  insertNodeAboveInput,
+  insertNodeAboveRoot,
+  leaveScope,
+  maskNodeRefs,
+  nodeOfInput,
+  noteFieldRename,
+  parkedNode,
+  removeNode,
+  viewNodes,
+} from './composite_provider_nodes.js';
+import {
+  TemporalInput,
+  inputDateElements,
+  isTemporalJoin,
+  readTemporalChoices,
+  stripTemporalJoin,
+  writeTemporalJoin,
+} from './composite_provider_temporal.js';
 
 /**
  * The schema version the modeling tools write on create is the major.minor of the content type
@@ -154,7 +177,8 @@ export async function bwGetCompositeProvider(
   // own pinned model buffer afterwards, which drops attributes the write did set.
   const result = await freshRead(path, HCPR_ACCEPT);
 
-  const xml = result.body;
+  const viewNodeTree = describeNodes(result.body);
+  const xml = enterScope(result.body);
   const objectStatus = result.headers['object_status'] ?? result.headers['OBJECT_STATUS'] ?? 'unknown';
   const timestamp = result.headers['timestamp'] ?? result.headers['TIMESTAMP'] ?? '';
 
@@ -258,11 +282,15 @@ export async function bwGetCompositeProvider(
       alias,
       ...(lastModified ? { last_modified: lastModified } : {}),
       provider_type: providerType,
+      ...(nodeOfInput(im[0]) ? { view_node: nodeOfInput(im[0]) } : {}),
+      ...(hanaViewOfInput(im[0]) ? { hana_view: hanaViewOfInput(im[0]) } : {}),
       mapping_count: allMappings.length,
       regular_mapping_count: allMappings.length - constantMappings.length,
       constant_mappings: constantMappings,
     });
   }
+
+  const filterExpression = viewNodeMatch ? setNodeFilter(viewNodeMatch[0], '').previous : '';
 
   // Build result
   const output: Record<string, unknown> = {
@@ -281,6 +309,8 @@ export async function bwGetCompositeProvider(
     last_changed_at: changedAt,
     last_changed_by: changedBy,
     view_node: { name: viewNodeName, type: viewType },
+    ...(viewNodeTree.length > 1 ? { view_nodes: viewNodeTree } : {}),
+    ...(filterExpression ? { filter_expression: filterExpression } : {}),
     inputs,
     fields: {
       total: totalFields,
@@ -337,6 +367,12 @@ export async function bwGetCompositeProvider(
       anchor_query_alias: extractAlias(aqRef),
       characteristic_query_alias: extractAlias(cqRef),
       operands,
+      inputs: [...readTemporalChoices(xml, viewNodeName)].map(([alias, choice]) => ({
+        alias,
+        ...(choice.showTimeDependent !== undefined ? { time_dependent_fields: choice.showTimeDependent } : {}),
+        ...(choice.validFrom ? { valid_from_field: choice.validFrom, valid_to_field: choice.validTo } : {}),
+        ...(choice.keyDate ? { key_date_field: choice.keyDate } : {}),
+      })),
     };
   }
 
@@ -370,9 +406,93 @@ function escapeXmlAttr(value: string): string {
     .replace(/"/g, '&quot;');
 }
 
+const HANA_VIEW_TYPES = ['calculationview', 'analyticview', 'attributeview'];
+const HANA_VIEW_ACCEPT = 'application/vnd.sap.bw.modeling.hanv-v1_0_0+xml';
+/** View type per SAP HANA view read in this process, needed to reference the view. */
+const hanaViewTypes = new Map<string, string>();
+
+/** A SAP HANA view is named "<package>::<view>", the way SAP HANA itself writes it. */
+export function parseHanaViewName(providerName: string): { packageName: string; viewName: string } | undefined {
+  const m = providerName.trim().match(/^([^:\s]+)::([^:\s]+)$/);
+  return m ? { packageName: m[1], viewName: m[2] } : undefined;
+}
+
 /** Relative entity reference used inside `<input><entity>…</entity></input>`. */
-function buildEntityRef(providerName: string): string {
+export function buildEntityRef(providerName: string): string {
+  const view = parseHanaViewName(providerName);
+  if (view) {
+    const type = hanaViewTypes.get(providerName.trim()) ?? HANA_VIEW_TYPES[0];
+    return `../../../hana/repository/${view.packageName.replace(/\./g, '/')}/${view.viewName}.${type}#/`;
+  }
   return `../../../infoprov_dt/a/${providerName.trim().toUpperCase()}.composite#//`;
+}
+
+/** "<package>::<view>" when the input is a SAP HANA view. */
+function hanaViewOfInput(inputBlock: string): string | undefined {
+  const name = nodeOfInput(inputBlock) ? undefined : extractProviderNameFromInput(inputBlock);
+  return name && parseHanaViewName(name) ? name : undefined;
+}
+
+/** The alias segment of an input: the view type for a SAP HANA view, the provider type otherwise. */
+function inputAliasType(providerName: string, providerType: string): string {
+  return parseHanaViewName(providerName) ? (hanaViewTypes.get(providerName.trim()) ?? HANA_VIEW_TYPES[0]) : providerType;
+}
+
+/** ABAP data type a field of a SAP HANA view is given in a CompositeProvider. */
+export function hanaFieldType(primitiveType: string, length: number, precision: number, scale: number): string | undefined {
+  switch (primitiveType.toUpperCase()) {
+    case 'CHAR': case 'NCHAR': case 'VARCHAR': case 'NVARCHAR': case 'ALPHANUM':
+      return length > 0 ? `<inlineType name="CHAR" length="${length}" semanticType="empty"/>` : undefined;
+    case 'INTEGER': case 'SMALLINT': case 'TINYINT':
+      return '<inlineType name="INT4" length="10" semanticType="empty"/>';
+    case 'BIGINT':
+      return '<inlineType name="DEC" precision="18" scale="0" semanticType="empty"/>';
+    case 'DECIMAL': case 'SMALLDECIMAL': case 'NUMERIC': {
+      const digits = Math.min(precision || length || 17, 31);
+      return `<inlineType name="DEC" precision="${digits}" scale="${Math.min(scale, digits)}" semanticType="empty"/>`;
+    }
+    case 'DOUBLE': case 'FLOAT': case 'REAL':
+      return '<inlineType name="FLTP" length="16" semanticType="empty"/>';
+    case 'DATE': case 'SECONDDATE': case 'TIMESTAMP':
+      return '<inlineType name="DATS" length="8" semanticType="date"/>';
+    case 'TIME':
+      return '<inlineType name="TIMS" length="6" semanticType="empty"/>';
+    default:
+      return undefined;
+  }
+}
+
+/** The fields of a SAP HANA view, in the shape the fields of a BW provider have. */
+export function hanaViewFields(xml: string): SourceFieldMeta[] {
+  const fields: SourceFieldMeta[] = [];
+  for (const m of xml.matchAll(/<element\b((?:[^>/]|\/(?!>))*)(?:\/>|>([\s\S]*?)<\/element>)/g)) {
+    const name = attr(m[1], 'name');
+    if (!name) continue;
+    const body = m[2] ?? '';
+    const type = body.match(/<inlineType\b[^>]*/)?.[0] ?? '';
+    const number = (key: string) => parseInt(attr(type, key) || '0', 10);
+    // An input parameter of the view is listed as an element of its own type, with an ABAP type
+    // already; BW takes its value from the field it is mapped to.
+    const inlineTypeXml = /\bxsi:type="/.test(m[1])
+      ? (attr(type, 'name') ? `${type.replace(/\/$/, '')}/>` : undefined)
+      : hanaFieldType(attr(type, 'primitiveType'), number('length'), number('precision'), number('scale'));
+    if (!inlineTypeXml) continue;
+    const aggregation = attr(m[1], 'aggregationBehavior');
+    fields.push({
+      sourceName: name,
+      defaultTargetName: name,
+      label: decodeXmlEntities(body.match(/<endUserTexts label="([^"]*)"/)?.[1] ?? ''),
+      inlineTypeXml,
+      dataType: attr(inlineTypeXml, 'name'),
+      isKeyFigure: Boolean(aggregation) && aggregation !== 'NONE',
+      aggregationBehavior: aggregation || 'NONE',
+      outputLength: 0,
+      isMetaObject: false,
+      compoundParents: [],
+      parameterXml: body.match(/<Parameter\b(?:[^>/]|\/(?!>))*(?:\/>|>[\s\S]*?<\/Parameter>)/)?.[0],
+    });
+  }
+  return fields;
 }
 
 export interface CompositeProviderCreateOptions {
@@ -522,6 +642,56 @@ const IPROV_ACCEPT = [
 
 const HCPR_PATH = (name: string) => `/sap/bw/modeling/hcpr/${bwSeg(name)}/m`;
 
+/** The document narrowed to the view node the call works on; `leaveScope` widens it before the PUT. */
+async function readModel(name: string): Promise<Awaited<ReturnType<typeof freshRead>>> {
+  const result = await freshRead(HCPR_PATH(name), HCPR_ACCEPT);
+  return { ...result, body: enterScope(result.body) };
+}
+
+/** The fields of a view node, in the shape the fields of a source provider have. */
+export function nodeSourceFields(nodeXml: string): SourceFieldMeta[] {
+  const fields: SourceFieldMeta[] = [];
+  for (const m of nodeXml.matchAll(/<element\b((?:[^>/]|\/(?!>))*)(?:\/>|>([\s\S]*?)<\/element>)/g)) {
+    const body = m[2] ?? '';
+    const name = attr(m[1], 'name');
+    if (!name) continue;
+    const inlineTypeXml = compositeInlineType(body);
+    const outputLengthRaw = attr(m[1], 'outputLength');
+    fields.push({
+      sourceName: name,
+      defaultTargetName: name,
+      infoObjectName: attr(m[1], 'infoObjectName') || undefined,
+      conversionType: attr(m[1], 'conversionType') || undefined,
+      label: decodeXmlEntities(body.match(/<endUserTexts label="([^"]*)"/)?.[1] ?? ''),
+      inlineTypeXml,
+      dataType: attr(inlineTypeXml, 'name'),
+      isKeyFigure: /LocalKeyfigureProperties/.test(body),
+      aggregationBehavior: attr(m[1], 'aggregationBehavior') || 'NONE',
+      conversionRoutine: attr(m[1], 'conversionRoutine') || undefined,
+      fixedUnit: body.match(/<fixedUnit\b[^>]*>([^<]*)<\/fixedUnit>/)?.[1],
+      fixedCurrency: body.match(/<fixedCurrency\b[^>]*>([^<]*)<\/fixedCurrency>/)?.[1],
+      unitCurrencyRefBareName: body.match(/<unitCurrencyElement>#\/\/\/[^/<]*\/([^<]*)<\/unitCurrencyElement>/)?.[1],
+      outputLength: outputLengthRaw ? parseInt(outputLengthRaw, 10) : 0,
+      isMetaObject: false,
+      compoundParents: [...body.matchAll(/<compoundInfoObjects?>#\/\/\/(?:[^/<]*\/)?([^<]+)<\/compoundInfoObjects?>/g)].map((c) => c[1]),
+    });
+  }
+  return fields;
+}
+
+/** What an input reads from: a provider, or the view node below it. */
+async function inputSource(inputBlock: string): Promise<{ providerName: string; fields: SourceFieldMeta[] } | undefined> {
+  const node = nodeOfInput(inputBlock);
+  if (node) {
+    const parked = parkedNode(node);
+    if (!parked) throw new Error(`View node ${node} below the input was not found.`);
+    return { providerName: `view node ${node}`, fields: nodeSourceFields(parked.xml) };
+  }
+  const providerName = extractProviderNameFromInput(inputBlock);
+  if (!providerName) return undefined;
+  return { providerName, fields: (await fetchCompositeSourceFields(providerName)).fields };
+}
+
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -604,12 +774,35 @@ export interface SourceFieldMeta {
   isMetaObject: boolean;
   /** Bare names of the source fields this one is compounded to. */
   compoundParents: string[];
+  /** A time-dependent attribute of a characteristic. */
+  timeDependent?: boolean;
+  /** Set for an input parameter of a SAP HANA view: its `<Parameter>` block. */
+  parameterXml?: string;
+  baseInfoObjectName?: string;
 }
 
 export interface CompoundingMapping {
   field: string;
   parent: string;
   target: string;
+  /** Set when the field brought along is the unit or currency of a key figure, not a compounding parent. */
+  unit?: boolean;
+}
+
+/** One sentence for the fields a mapping brought along. */
+function broughtAlongNote(list: CompoundingMapping[]): string {
+  const parents = list.filter((c) => !c.unit);
+  const units = list.filter((c) => c.unit);
+  return (
+    (parents.length
+      ? ' Also mapped, since a compounded field needs its compounding parent: ' +
+        parents.map((c) => `${c.parent} -> ${c.target} (parent of ${c.field})`).join(', ') + '.'
+      : '') +
+    (units.length
+      ? ' Also mapped, since an amount or quantity needs its currency or unit: ' +
+        units.map((c) => `${c.parent} -> ${c.target} (of ${c.field})`).join(', ') + '.'
+      : '')
+  );
 }
 
 // Pure CUKY/UNIT fields are bound to the standard currency/unit characteristics at
@@ -648,6 +841,17 @@ const SEMANTICS_TAG: Record<string, string> = {
 export async function fetchCompositeSourceFields(
   providerName: string
 ): Promise<{ fieldNamePrefix: string; lastModified?: string; fields: SourceFieldMeta[] }> {
+  const hanaView = parseHanaViewName(providerName);
+  if (hanaView) {
+    const viewXml = (await freshRead(
+      `/sap/bw/modeling/hana/repository/${encodeURIComponent(hanaView.packageName)}/${encodeURIComponent(hanaView.viewName)}`,
+      HANA_VIEW_ACCEPT,
+    )).body;
+    const type = attr(viewXml.match(/<entity:Entity\b[^>]*/)?.[0] ?? '', 'objectType');
+    if (HANA_VIEW_TYPES.includes(type)) hanaViewTypes.set(providerName.trim(), type);
+    // A view has no generated field names; the prefix only says that the fields were read.
+    return { fieldNamePrefix: hanaView.viewName, fields: hanaViewFields(viewXml) };
+  }
   const path = `/sap/bw/modeling/infoprov/${bwSegUpper(providerName)}/a?view=dt`;
   const xml = (await freshRead(path, IPROV_ACCEPT)).body;
 
@@ -694,11 +898,16 @@ export async function fetchCompositeSourceFields(
         conversionRoutine: attr(elemAttrs, 'conversionRoutine') || undefined,
         fixedUnit: body.match(/<fixedUnit\b[^>]*>([^<]*)<\/fixedUnit>/)?.[1],
         fixedCurrency: body.match(/<fixedCurrency\b[^>]*>([^<]*)<\/fixedCurrency>/)?.[1],
+        // A field of the provider itself carries the provider prefix, an InfoObject its bare name.
         unitCurrencyRefBareName: unitCurrencyRaw?.startsWith(refPrefix)
           ? unitCurrencyRaw.slice(refPrefix.length)
-          : undefined,
+          : unitCurrencyRaw?.startsWith('#///') && !unitCurrencyRaw.slice(4).includes('/')
+            ? unitCurrencyRaw.slice(4)
+            : undefined,
         outputLength: outputLengthRaw ? parseInt(outputLengthRaw, 10) : 0,
         isMetaObject: isTechnicalSourceElement(body),
+        timeDependent: attr(elemAttrs, 'timeDependent') === 'true' || undefined,
+        baseInfoObjectName: attr(elemAttrs, 'baseInfoObjectName') || undefined,
         compoundParents: [...body.matchAll(/<compoundInfoObject>#\/\/\/([^<]+)<\/compoundInfoObject>/g)]
           .map((c) => (c[1].startsWith(`${fieldNamePrefix}-`) ? c[1].slice(fieldNamePrefix.length + 1) : c[1])),
       });
@@ -788,7 +997,9 @@ function buildTargetElementXml(
   ].join(' ');
 
   const label = escapeXmlAttr(field.label);
-  const lines: string[] = [`  <element xsi:type="BwCore:BwElement" ${attrs}>`];
+  // An input parameter of a SAP HANA view needs a parameter as its target, with the same definition.
+  const elementType = field.parameterXml ? 'BwCore:RestrictedBwElement' : 'BwCore:BwElement';
+  const lines: string[] = [`  <element xsi:type="${elementType}" ${attrs}>`];
   if (inlineType) lines.push(`    ${inlineType}`);
   lines.push(...fixedLines);
   if (field.unitCurrencyRefBareName) {
@@ -809,6 +1020,7 @@ function buildTargetElementXml(
     lines.push(`    </localProperties>`);
     if (infoObjectName) lines.push(`    <associationType>1</associationType>`);
   }
+  if (field.parameterXml) lines.push(`    ${field.parameterXml}`);
   lines.push(`  </element>`);
   return lines.join('\n');
 }
@@ -832,8 +1044,13 @@ function resolveMappings(
   providerName: string,
   nodeName: string,
   existingXml: string,
-  defaults: NewElementDefaults = {}
+  defaults: NewElementDefaults = {},
+  ownAlias?: string
 ): { mappingsXml: string[]; newElementsXml: string[]; groups: Set<string>; compounding: CompoundingMapping[] } {
+  const fedByOthers = (target: string) =>
+    [...existingXml.matchAll(/<input\b[^>]*>[\s\S]*?<\/input>/g)].some((block) =>
+      attr(block[0].match(/<input\b[^>]*>/)?.[0] ?? '', 'alias') !== ownAlias &&
+      [...block[0].matchAll(/<mapping\b[^>]*>/g)].some((mapping) => attr(mapping[0], 'targetName') === target));
   // A compounded field needs its compounding parent as a field of the CompositeProvider
   // ("compounding parent … is missing for field …"). The modeling tools map the parents of
   // a compounded source field along with it; a parent the caller maps itself is left alone.
@@ -856,6 +1073,22 @@ function resolveMappings(
       mappings.splice(i, 0, { target, source: parent });
       compounding.push({ field: m.target.trim().toUpperCase(), parent, target });
       i++;
+    }
+    // An amount or quantity needs its currency or unit as a field ("no currency information
+    // for amount key figure …"); the modeling tools map it along with the key figure.
+    const unit = field?.unitCurrencyRefBareName;
+    const unitField = unit ? byBare.get(unit) : undefined;
+    if (unit && unitField && !mappings.some((o) => o.constantValue === undefined && sourceOf(o) === unit)) {
+      const target = shortenTargetName(unit);
+      const present = [...existingXml.matchAll(/<element\b[^>]*>/g)].find((e) =>
+        attr(e[0], 'name') === target ||
+        (unitField.infoObjectName !== undefined && attr(e[0], 'infoObjectName') === unitField.infoObjectName));
+      // In a union every input feeds the field; elsewhere only one input may.
+      if (!present || getViewNodeType(existingXml) === 'Union' || !fedByOthers(attr(present[0], 'name'))) {
+        const onto = present ? attr(present[0], 'name') : target;
+        mappings.splice(i + 1, 0, { target: onto, source: unit });
+        compounding.push({ field: m.target.trim().toUpperCase(), parent: unit, target: onto, unit: true });
+      }
     }
   }
 
@@ -985,7 +1218,7 @@ function buildAutoMappings(
 
 /** Next free alias for a view node and provider type, continuing BW's own numbering. */
 function nextInputAlias(xml: string, nodeName: string, providerType: string): string {
-  const type = providerType.trim().toUpperCase();
+  const type = HANA_VIEW_TYPES.includes(providerType.trim()) ? providerType.trim() : providerType.trim().toUpperCase();
   const re = new RegExp(`alias="${escapeRegex(nodeName)}\\.${escapeRegex(type)}\\.(\\d+)"`, 'g');
   let max = 0;
   let m: RegExpExecArray | null;
@@ -995,6 +1228,13 @@ function nextInputAlias(xml: string, nodeName: string, providerType: string): st
 
 /** Extracts the source provider name from an input's entity reference. */
 function extractProviderNameFromInput(inputBlock: string): string | undefined {
+  const view = inputBlock.match(
+    /<entity>(?:[^<]*hana\/repository\/)?([^<#]+)\/([^<#/]+)\.(calculationview|analyticview|attributeview)#\/<\/entity>/);
+  if (view) {
+    const name = `${view[1].replace(/\//g, '.')}::${view[2]}`;
+    hanaViewTypes.set(name, view[3]);
+    return name;
+  }
   return inputBlock.match(/(?:infoprov_dt\/a\/)?([A-Za-z0-9_]+)\.composite#\/\//)?.[1];
 }
 
@@ -1023,7 +1263,7 @@ export async function bwUpdateCompositeProviderInput(
 ): Promise<string> {
   const { input, inputAlias, transport, defaults } = opts;
   const cpUpper = compositeProviderName.toUpperCase();
-  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const cpResult = await readModel(compositeProviderName);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
   let xml = cpResult.body;
 
@@ -1073,7 +1313,7 @@ export async function bwUpdateCompositeProviderInput(
         ? input.mappings
         : buildAutoMappings(fields, xml, getViewNodeType(xml));
 
-    const alias = nextInputAlias(xml, nodeName, input.providerType);
+    const alias = nextInputAlias(xml, nodeName, inputAliasType(input.providerName, input.providerType));
     const { mappingsXml, newElementsXml, groups, compounding } = resolveMappings(
       requested, fields, input.providerName, nodeName, xml, defaults
     );
@@ -1099,15 +1339,13 @@ export async function bwUpdateCompositeProviderInput(
     message =
       `Input ${alias} (${input.providerName.toUpperCase()}) added to CompositeProvider ${cpUpper} ` +
       `with ${mappingsXml.length} mapping(s). Call bw_activate to activate.` +
-      (compounding.length
-        ? ' Also mapped, since a compounded field needs its compounding parent: ' +
-          compounding.map((c) => `${c.parent} -> ${c.target} (parent of ${c.field})`).join(', ') + '.'
-        : '');
+      broughtAlongNote(compounding);
   }
 
+  xml = await keepTemporalJoin(xml);
   const lockHandle = await client.lock('hcpr', compositeProviderName);
   try {
-    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
+    await client.put('hcpr', compositeProviderName, lockHandle, leaveScope(xml), timestamp, transport);
   } catch (err) {
     await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
     throw err;
@@ -1121,6 +1359,259 @@ export async function bwUpdateCompositeProviderInput(
     object_type: 'hcpr',
     ...(resultAlias ? { input_alias: resultAlias } : {}),
     ...(compoundingAdded.length ? { compounding_parents_mapped: compoundingAdded } : {}),
+  });
+}
+
+/**
+ * The name a mapped source field has on another provider. A field-based provider prefixes its
+ * fields with its own name, so the field is looked up by its bare name; the attribute part of a
+ * navigation attribute is carried over as it is.
+ */
+export function translateSourceName(
+  sourceName: string,
+  oldFields: SourceFieldMeta[],
+  newFields: SourceFieldMeta[],
+): string | undefined {
+  const cut = sourceName.search(/=|__/);
+  const base = cut > 0 ? sourceName.slice(0, cut) : sourceName;
+  const suffix = cut > 0 ? sourceName.slice(cut) : '';
+  const bare =
+    oldFields.find((f) => f.sourceName === base)?.defaultTargetName ?? base.slice(base.lastIndexOf('-') + 1);
+  const found = newFields.find((f) => f.defaultTargetName === bare && !f.isMetaObject);
+  return found ? found.sourceName + suffix : undefined;
+}
+
+export interface ReplacedInput {
+  xml: string;
+  kept: number;
+  /** Mappings whose source field the new provider does not have. */
+  dropped: Array<{ target: string; source: string }>;
+}
+
+/**
+ * Put another provider in the place of one input. The mappings stay where the new provider has
+ * a field of the same name, constants stay as they are, and the joins that name the input name
+ * the new one, with their keys translated. A join key the new provider lacks is an error:
+ * the condition has to be changed first.
+ */
+export function replaceInput(
+  xml: string,
+  alias: string,
+  by: { alias: string; providerName: string; lastModified?: string },
+  translate: (sourceName: string) => string | undefined,
+): ReplacedInput {
+  const block = inputBlockOf(xml, alias);
+  if (!block) throw new Error(`Input ${alias} not found.`);
+  const dropped: Array<{ target: string; source: string }> = [];
+  const mappings: string[] = [];
+  for (const m of block.matchAll(/<mapping\b[^>]*\/>/g)) {
+    if (m[0].includes('ConstantElementMapping')) {
+      mappings.push(`    ${m[0]}`);
+      continue;
+    }
+    const source = attr(m[0], 'sourceName');
+    const target = attr(m[0], 'targetName');
+    const translated = translate(source);
+    if (translated === undefined) {
+      dropped.push({ target, source });
+      continue;
+    }
+    mappings.push(`    <mapping xsi:type="Type:ElementMapping" targetName="${target}" sourceName="${translated}"/>`);
+  }
+  const lastModifiedAttr = by.lastModified ? ` lastModified="${by.lastModified}"` : '';
+  const newBlock =
+    `<input xsi:type="Composite:CompositeInput" alias="${by.alias}" selectAll="false"` +
+    ` hiddenNavigationAttributes="true" hiddenTemporalFields="false"${lastModifiedAttr}>\n` +
+    `    <entity>${buildEntityRef(by.providerName)}</entity>\n` +
+    (mappings.length ? `${mappings.join('\n')}\n` : '') +
+    `  </input>`;
+  let out = xml.replace(block, () => newBlock);
+
+  out = out.replace(/<join\b([^>]*)>([\s\S]*?)<\/join>/g, (join, head: string, body: string) => {
+    const isLeft = attr(head, 'leftInput').replace(/^.*\//, '') === alias;
+    const isRight = attr(head, 'rightInput').replace(/^.*\//, '') === alias;
+    if (!isLeft && !isRight) return join;
+    const side = (tag: string, text: string) =>
+      text.replace(new RegExp(`<${tag}>([^<]*)</${tag}>`, 'g'), (_all, key: string) => {
+        const translated = translate(key);
+        if (translated === undefined) {
+          throw new Error(
+            `Join key ${key} of input ${alias} does not exist on ${by.providerName.toUpperCase()}. ` +
+            'Change the join condition first ("update_join"), then replace the input.',
+          );
+        }
+        return `<${tag}>${translated}</${tag}>`;
+      });
+    let newBody = body;
+    let newHead = head;
+    const swap = (name: string) =>
+      newHead.replace(new RegExp(`(\\b${name}="[^"]*/)${escapeRegex(alias)}"`), (_all, lead: string) => `${lead}${by.alias}"`);
+    if (isLeft) {
+      newBody = side('leftElementName', newBody);
+      newHead = swap('leftInput');
+    }
+    if (isRight) {
+      newBody = side('rightElementName', newBody);
+      newHead = swap('rightInput');
+    }
+    return `<join${newHead}>${newBody}</join>`;
+  });
+  return { xml: out, kept: mappings.length, dropped };
+}
+
+/**
+ * bw_update_composite_provider action "replace_input" — put another provider in the place of
+ * one input and keep the mappings and joins that still fit.
+ */
+export async function bwReplaceCompositeProviderInput(
+  client: BwClient,
+  compositeProviderName: string,
+  inputAlias: string,
+  input: { providerName: string; providerType: string },
+  transport?: string,
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  const alias = (inputAlias ?? '').trim();
+  if (!alias) throw new Error('replace_input requires input_alias.');
+  if (!input.providerName) throw new Error('replace_input requires provider_name.');
+  const cpResult = await readModel(compositeProviderName);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  const xml = cpResult.body;
+  const block = inputBlockOf(xml, alias);
+  if (!block) {
+    return JSON.stringify({
+      success: false,
+      message: `Input ${alias} not found in CompositeProvider ${cpUpper}. No changes made.`,
+    });
+  }
+  if (nodeOfInput(block)) {
+    throw new Error(`Input ${alias} is the view node ${nodeOfInput(block)}, not a provider. Remove the node ("remove_node") and add the provider ("add_input").`);
+  }
+  const nodeName = getViewNodeName(xml);
+  const oldProvider = extractProviderNameFromInput(block);
+  // The provider being replaced may be gone; its field names are then taken as they stand.
+  const oldFields = oldProvider
+    ? (await fetchCompositeSourceFields(oldProvider).catch(() => ({ fields: [] as SourceFieldMeta[] }))).fields
+    : [];
+  const { lastModified, fields: newFields } = await fetchCompositeSourceFields(input.providerName);
+  const newAlias = nextInputAlias(xml, nodeName, inputAliasType(input.providerName, input.providerType));
+  const result = replaceInput(
+    xml, alias,
+    { alias: newAlias, providerName: input.providerName, lastModified },
+    (sourceName) => translateSourceName(sourceName, oldFields, newFields),
+  );
+  result.xml = await keepTemporalJoin(result.xml);
+  const lockHandle = await putModel(client, compositeProviderName, result.xml, timestamp, transport);
+  return JSON.stringify({
+    success: true,
+    message:
+      `Input ${alias}${oldProvider ? ` (${oldProvider.toUpperCase()})` : ''} of CompositeProvider ${cpUpper} replaced by ` +
+      `${input.providerName.toUpperCase()} as ${newAlias}; ${result.kept} mapping(s) kept.` +
+      (result.dropped.length
+        ? ` ${result.dropped.length} mapping(s) dropped, since the new provider has no field of that name: ` +
+          result.dropped.map((d) => `${d.source} -> ${d.target}`).join(', ') +
+          '. Their target fields stay and can be mapped anew ("update_mapping").'
+        : '') +
+      ' Call bw_activate to activate.',
+    input_alias: newAlias,
+    ...(result.dropped.length ? { dropped_mappings: result.dropped } : {}),
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+  });
+}
+
+const NODE_KINDS: Record<string, NodeKind> = {
+  join: 'Join', union: 'Union', projection: 'Projection', aggregation: 'Aggregation',
+};
+
+/**
+ * bw_update_composite_provider action "insert_node" — put a join, union, projection or
+ * aggregation node above one input, or above the default node when no input is named.
+ * A join node needs its second input right away, so it takes a provider.
+ */
+export async function bwInsertCompositeProviderNode(
+  client: BwClient,
+  compositeProviderName: string,
+  opts: { nodeType?: string; inputAlias?: string; providerName?: string; providerType?: string; transport?: string },
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  const kind = NODE_KINDS[(opts.nodeType ?? '').trim().toLowerCase()];
+  if (!kind) throw new Error('insert_node requires node_type: join, union, projection or aggregation.');
+  if (kind === 'Join' && !opts.providerName) {
+    throw new Error('insert_node with node_type "join" requires provider_name: the provider the new node joins.');
+  }
+  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  refuseOnTemporalJoin(cpResult.body, 'insert_node', cpUpper);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  const alias = opts.inputAlias?.trim();
+  const inserted = alias
+    ? insertNodeAboveInput(cpResult.body, alias, kind)
+    : insertNodeAboveRoot(cpResult.body, kind);
+  let xml = inserted.xml;
+  let partnerAlias: string | undefined;
+  if (kind === 'Join' && opts.providerName) {
+    const { lastModified } = await fetchCompositeSourceFields(opts.providerName);
+    partnerAlias = nextInputAlias(xml, inserted.node, opts.providerType ?? 'ADSO');
+    const lastModifiedAttr = lastModified ? ` lastModified="${lastModified}"` : '';
+    xml = addJoinPartner(
+      xml, inserted.node,
+      `<input xsi:type="Composite:CompositeInput" alias="${partnerAlias}" selectAll="false"` +
+      ` hiddenNavigationAttributes="true" hiddenTemporalFields="false"${lastModifiedAttr}>` +
+      `<entity>${buildEntityRef(opts.providerName)}</entity></input>`,
+      partnerAlias,
+    );
+  }
+  const lockHandle = await putModel(client, compositeProviderName, xml, timestamp, opts.transport);
+  return JSON.stringify({
+    success: true,
+    message:
+      `View node ${inserted.node} (${kind}) inserted into CompositeProvider ${cpUpper} ` +
+      (inserted.parent ? `above input ${alias}, as an input of node ${inserted.parent}` : 'on top; it is the default node now') +
+      ` with ${inserted.fields.length} field(s).` +
+      (partnerAlias
+        ? ` ${opts.providerName!.toUpperCase()} is its second input ${partnerAlias}, without mappings and without a join condition: ` +
+          `set them with "update_mapping" and "update_join" and node "${inserted.node}".`
+        : ` Address the node in further calls with node "${inserted.node}".`) +
+      ' Call bw_activate to activate.',
+    node: inserted.node,
+    ...(inserted.parent ? { input_of: inserted.parent } : {}),
+    ...(partnerAlias ? { input_alias: partnerAlias } : {}),
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+  });
+}
+
+/**
+ * bw_update_composite_provider action "remove_node" — take a view node out together with
+ * the nodes below it.
+ */
+export async function bwRemoveCompositeProviderNode(
+  client: BwClient,
+  compositeProviderName: string,
+  nodeName: string | undefined,
+  transport?: string,
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  if (!nodeName?.trim()) throw new Error('remove_node requires node.');
+  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  refuseOnTemporalJoin(cpResult.body, 'remove_node', cpUpper);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  const result = removeNode(cpResult.body, nodeName.trim());
+  const lockHandle = await putModel(client, compositeProviderName, result.xml, timestamp, transport);
+  return JSON.stringify({
+    success: true,
+    message:
+      `View node(s) ${result.removed.join(', ')} removed from CompositeProvider ${cpUpper}.` +
+      (result.parent
+        ? ` Node ${result.parent} lost the input; its fields stay and can be fed by another input ("add_input" with node "${result.parent}").`
+        : '') +
+      ' Call bw_activate to activate.',
+    removed_nodes: result.removed,
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
   });
 }
 
@@ -1144,7 +1635,7 @@ export async function bwUpdateCompositeProviderMapping(
 ): Promise<string> {
   const cpUpper = compositeProviderName.toUpperCase();
   const alias = inputAlias.trim();
-  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const cpResult = await readModel(compositeProviderName);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
   let xml = cpResult.body;
 
@@ -1158,16 +1649,16 @@ export async function bwUpdateCompositeProviderMapping(
     });
   }
 
-  const providerName = extractProviderNameFromInput(inputMatch[0]);
-  if (!providerName) {
+  const source = await inputSource(inputMatch[0]);
+  if (!source) {
     throw new Error(`Could not determine the source InfoProvider for input ${alias}.`);
   }
+  const { providerName, fields } = source;
   const nodeName = getViewNodeName(xml);
-  const { fields } = await fetchCompositeSourceFields(providerName);
 
   const effective = mappings.length > 0 ? mappings : buildAutoMappings(fields, xml, getViewNodeType(xml), alias);
   const { mappingsXml, newElementsXml, groups, compounding } = resolveMappings(
-    effective, fields, providerName, nodeName, xml, defaults
+    effective, fields, providerName, nodeName, xml, defaults, alias
   );
 
   if (newElementsXml.length > 0) {
@@ -1178,11 +1669,13 @@ export async function bwUpdateCompositeProviderMapping(
   xml = ensureNamespace(xml, 'Type', 'http://www.sap.com/ndb/DataModelType.ecore');
 
   // Keep the input's opening tag and entity reference, replace only the mapping list.
+  const dateElements = inputDateElements(
+    xml.match(new RegExp(`<input\\b[^>]*\\balias="${escapeRegex(alias)}"[^>]*>[\\s\\S]*?<\\/input>`))?.[0] ?? '');
   xml = xml.replace(
     new RegExp(
-      `(<input\\b[^>]*\\balias="${escapeRegex(alias)}"[^>]*>\\s*<entity>[^<]*<\\/entity>)[\\s\\S]*?(<\\/input>)`
+      `(<input\\b[^>]*\\balias="${escapeRegex(alias)}"[^>]*>\\s*(?:<entity>[^<]*<\\/entity>|<nodeRef\\b[^>]*>[^<]*<\\/nodeRef>))[\\s\\S]*?(<\\/input>)`
     ),
-    `$1\n${mappingsXml.join('\n')}\n  $2`
+    (_all, head: string, tail: string) => `${head}\n${mappingsXml.join('\n')}\n  ${dateElements}${tail}`
   );
 
   // Replacing a mapping list can leave fields behind that no input feeds any more.
@@ -1193,7 +1686,7 @@ export async function bwUpdateCompositeProviderMapping(
 
   const lockHandle = await client.lock('hcpr', compositeProviderName);
   try {
-    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
+    await client.put('hcpr', compositeProviderName, lockHandle, leaveScope(xml), timestamp, transport);
   } catch (err) {
     await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
     throw err;
@@ -1204,10 +1697,7 @@ export async function bwUpdateCompositeProviderMapping(
     message:
       `Mappings for input ${alias} in CompositeProvider ${cpUpper} replaced ` +
       `(${mappingsXml.length} mapping(s)). Call bw_activate to activate.` +
-      (compounding.length
-        ? ' Also mapped, since a compounded field needs its compounding parent: ' +
-          compounding.map((c) => `${c.parent} -> ${c.target} (parent of ${c.field})`).join(', ') + '.'
-        : '') +
+      broughtAlongNote(compounding) +
       (unmapped.length
         ? ` Fields without a mapping from any input now: ${unmapped.join(', ')}; remove them with "remove_field" or map them.`
         : ''),
@@ -1235,7 +1725,7 @@ export async function bwUpdateCompositeProviderSettings(
   settings: CompositeProviderSettings
 ): Promise<string> {
   const cpUpper = compositeProviderName.toUpperCase();
-  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const cpResult = await readModel(compositeProviderName);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
   let xml = cpResult.body;
 
@@ -1260,7 +1750,7 @@ export async function bwUpdateCompositeProviderSettings(
 
   const lockHandle = await client.lock('hcpr', compositeProviderName);
   try {
-    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, settings.transport);
+    await client.put('hcpr', compositeProviderName, lockHandle, leaveScope(xml), timestamp, settings.transport);
   } catch (err) {
     await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
     throw err;
@@ -1287,7 +1777,7 @@ async function putModel(
 ): Promise<string> {
   const lockHandle = await client.lock('hcpr', compositeProviderName);
   try {
-    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
+    await client.put('hcpr', compositeProviderName, lockHandle, leaveScope(xml), timestamp, transport);
   } catch (err) {
     await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
     throw err;
@@ -1318,16 +1808,21 @@ export async function bwUpdateCompositeProviderFields(
   client: BwClient,
   compositeProviderName: string,
   fieldNames: string[],
-  opts: { dimension?: string; nameUsage?: NameUsage; transport?: string }
+  opts: { dimension?: string; nameUsage?: NameUsage; description?: string; newName?: string; transport?: string }
 ): Promise<string> {
   const cpUpper = compositeProviderName.toUpperCase();
-  const { dimension, nameUsage, transport } = opts;
+  const { dimension, nameUsage, description, transport } = opts;
+  const newName = opts.newName?.trim().toUpperCase();
   if (fieldNames.length === 0) throw new Error('update_fields requires info_object_name (one or more field names).');
-  if (dimension === undefined && nameUsage === undefined) {
-    throw new Error('update_fields requires dimension and/or name_usage.');
+  if (dimension === undefined && nameUsage === undefined && description === undefined && newName === undefined) {
+    throw new Error('update_fields requires dimension, name_usage, field_description and/or new_field_name.');
+  }
+  if (newName !== undefined) {
+    if (fieldNames.length !== 1) throw new Error('new_field_name renames one field: pass exactly one field in info_object_name.');
+    if (!/^[A-Z0-9_/][A-Z0-9_/]{0,29}$/.test(newName)) throw new Error(`"${opts.newName}" is not a field name: up to 30 characters, letters, digits and underscores.`);
   }
 
-  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const cpResult = await readModel(compositeProviderName);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
   let xml = cpResult.body;
 
@@ -1381,8 +1876,54 @@ export async function bwUpdateCompositeProviderFields(
       result['name_usage'] = nameUsage;
     }
 
+    if (description !== undefined) {
+      const label = description.trim().replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      if (attr(openTag, 'infoObjectName')) {
+        // A field bound to an InfoObject shows the text of the InfoObject; a text of its own is a
+        // local property of the field, and the server puts the InfoObject text back anywhere else.
+        const local = newElement.match(/<localProperties\b([^>]*?)(?:\/>|>([\s\S]*?)<\/localProperties>)/);
+        if (!local) {
+          skipped.push({ field, reason: 'the element carries no local properties to hold a description of its own' });
+          continue;
+        }
+        const inner = (local[2] ?? '').replace(/<descriptions\b[^>]*\/>/, '');
+        const own = label ? `<descriptions label="${label}"/>` : '';
+        newElement = newElement.replace(local[0], () => `<localProperties${local[1]}>${own}${inner}</localProperties>`);
+      } else {
+        const texts = newElement.match(/<endUserTexts\b[^>]*\/>/)?.[0];
+        newElement = texts
+          ? newElement.replace(texts, () => `<endUserTexts label="${label}"/>`)
+          : newElement.replace(openTag, () => `${openTag}<endUserTexts label="${label}"/>`);
+      }
+      result['description'] = description.trim();
+    }
+
+    if (newName !== undefined && newName !== field) {
+      // A field that is exposed under the name of its InfoObject is found by queries under that
+      // name; it keeps it until the name usage is switched, which the same call may do.
+      const inline = newElement.match(/<inlineType\b[^>]*\/>/)?.[0] ?? '';
+      if (attr(inline, 'globalElementName')) {
+        skipped.push({ field, reason: `it is exposed under the InfoObject name ${attr(inline, 'globalElementName')}; switch name_usage to "unique_name" first` });
+        continue;
+      }
+      if (findViewElement(xml, newName)) {
+        skipped.push({ field, reason: `CompositeProvider ${cpUpper} already has a field ${newName}` });
+        continue;
+      }
+      newOpen = setElementAttr(newOpen, 'name', newName);
+      noteFieldRename(field, newName);
+      result['renamed_to'] = newName;
+    }
+
     newElement = newElement.replace(openTag, () => newOpen);
     xml = xml.replace(element, () => newElement);
+    if (result['renamed_to']) {
+      // Everything that points at the field: the mappings of every input, and the references of
+      // other fields to it (unit or currency, compounding).
+      xml = xml
+        .replace(new RegExp(`(<mapping\\b[^>]*\\btargetName=")${escapeRegex(field)}(")`, 'g'), `$1${newName}$2`)
+        .replace(new RegExp(`(#\\/\\/\\/[^/<"]+\\/)${escapeRegex(field)}(?=[<"])`, 'g'), `$1${newName}`);
+    }
     changed.push(result);
   }
 
@@ -1403,6 +1944,245 @@ export async function bwUpdateCompositeProviderFields(
   });
 }
 
+/** The inputs of the view node with what the temporal join needs to know about their providers. */
+async function temporalInputsOf(xml: string): Promise<{ nodeName: string; nodeType: string; inputs: TemporalInput[] }> {
+  const node = xml.match(/<viewNode\b([^>]*)>[\s\S]*?<\/viewNode>/);
+  if (!node) throw new Error('The CompositeProvider has no view node.');
+  const inputs: TemporalInput[] = [];
+  for (const m of node[0].matchAll(/<input\b([^>]*)>[\s\S]*?<\/input>/g)) {
+    const alias = attr(m[1], 'alias');
+    const providerName = nodeOfInput(m[0]) ? undefined : extractProviderNameFromInput(m[0]);
+    if (!alias || !providerName) continue;
+    const kind = (alias.split('.')[1] ?? '').toUpperCase();
+    const fields = kind === 'IOBJ' || kind === 'ADSO'
+      ? (await fetchCompositeSourceFields(providerName)).fields.filter((f) => !f.isMetaObject)
+      : [];
+    inputs.push({
+      alias,
+      providerName: providerName.toUpperCase(),
+      kind,
+      fields: fields.map((f) => f.sourceName),
+      timeDependent: kind === 'IOBJ' && fields.some((f) => f.timeDependent),
+      baseName: fields.find((f) => f.sourceName === providerName.toUpperCase())?.baseInfoObjectName,
+    });
+  }
+  return { nodeName: attr(node[1], 'name'), nodeType: attr(node[1], 'xsi:type'), inputs };
+}
+
+/** A change to the inputs of a temporal join: its parts are written anew for the inputs that are there now. */
+async function keepTemporalJoin(xml: string): Promise<string> {
+  if (!isTemporalJoin(xml)) return xml;
+  const { nodeName, inputs } = await temporalInputsOf(xml);
+  return writeTemporalJoin(xml, nodeName, inputs, readTemporalChoices(xml, nodeName)).xml;
+}
+
+function refuseOnTemporalJoin(xml: string, action: string, cpUpper: string): void {
+  if (isTemporalJoin(xml)) {
+    throw new Error(
+      `CompositeProvider ${cpUpper} is a temporal join, which lives in one join node; ${action} is not available on it. ` +
+      'Switch the temporal join off with action "update_temporal_join" (temporal_join: false) first.');
+  }
+}
+
+export interface TemporalJoinOptions {
+  enabled?: boolean;
+  inputAlias?: string;
+  timeDependentFields?: boolean;
+  validFromField?: string;
+  validToField?: string;
+  keyDateField?: string;
+  transport?: string;
+}
+
+/**
+ * bw_update_composite_provider action "update_temporal_join" — make a join temporal, change
+ * where the validity of an input comes from, or switch the temporal join off.
+ */
+export async function bwUpdateCompositeProviderTemporalJoin(
+  client: BwClient,
+  compositeProviderName: string,
+  opts: TemporalJoinOptions,
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  const cpResult = await readModel(compositeProviderName);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  const xml = cpResult.body;
+  const { nodeName, nodeType, inputs } = await temporalInputsOf(xml);
+  if (!nodeType.endsWith('JoinNode')) {
+    throw new Error(`A temporal join needs a join node; view node ${nodeName} of CompositeProvider ${cpUpper} is not one.`);
+  }
+  if (viewNodes(maskNodeRefs(leaveScope(xml))).length > 1) {
+    throw new Error(`A temporal join is written for a CompositeProvider with one join node; ${cpUpper} has several view nodes.`);
+  }
+
+  if (opts.enabled === false) {
+    if (!isTemporalJoin(xml)) {
+      return JSON.stringify({ success: true, changed: false, message: `CompositeProvider ${cpUpper} is not a temporal join. Nothing was saved.` });
+    }
+    const lock = await putModel(client, compositeProviderName, stripTemporalJoin(xml, inputs.map((i) => i.alias)), timestamp, opts.transport);
+    return JSON.stringify({
+      success: true,
+      message: `Temporal join of CompositeProvider ${cpUpper} switched off. Call bw_activate to activate.`,
+      temporal_join: false,
+      lock_handle: lock,
+      composite_provider_name: cpUpper,
+      object_type: 'hcpr',
+    });
+  }
+
+  if (setNodeFilter(xml, '').previous) {
+    throw new Error(
+      `View node ${nodeName} of CompositeProvider ${cpUpper} has an SQL filter, which BW does not allow on a temporal join. ` +
+      'Remove it first with action "update_filter" and an empty filter_expression.');
+  }
+  const choices = readTemporalChoices(xml, nodeName);
+  const perInput =[opts.timeDependentFields, opts.validFromField, opts.validToField, opts.keyDateField].some((v) => v !== undefined);
+  if (perInput) {
+    const alias = opts.inputAlias?.trim();
+    const input = inputs.find((i) => i.alias === alias);
+    if (!input) {
+      throw new Error(
+        `update_temporal_join needs input_alias for time_dependent_fields, valid_from_field, valid_to_field and key_date_field. ` +
+        `Inputs of ${cpUpper}: ${inputs.map((i) => i.alias).join(', ') || '(none)'}.`);
+    }
+    const choice = { ...(choices.get(input.alias) ?? {}) };
+    const dateField = (given: string, param: string): string | undefined => {
+      const wanted = given.trim().toUpperCase();
+      if (!wanted) return undefined;
+      const field = input.fields.find((f) => f === wanted || f.endsWith(`-${wanted}`));
+      if (!field) throw new Error(`${param}: ${wanted} is not a field of ${input.providerName}. Fields: ${input.fields.join(', ')}.`);
+      return field;
+    };
+    if (opts.timeDependentFields !== undefined) {
+      if (input.kind !== 'IOBJ' || !input.timeDependent) {
+        throw new Error(`time_dependent_fields applies to a characteristic with time-dependent attributes; ${input.providerName} (${input.alias}) is not one.`);
+      }
+      choice.showTimeDependent = opts.timeDependentFields;
+    }
+    if (opts.validFromField !== undefined || opts.validToField !== undefined) {
+      if (input.kind !== 'ADSO') {
+        throw new Error(`valid_from_field and valid_to_field apply to an aDSO input; ${input.providerName} (${input.alias}) is of type ${input.kind}.`);
+      }
+      const from = dateField(opts.validFromField ?? choice.validFrom ?? '', 'valid_from_field');
+      const to = dateField(opts.validToField ?? choice.validTo ?? '', 'valid_to_field');
+      if (Boolean(from) !== Boolean(to)) throw new Error('A validity interval needs both valid_from_field and valid_to_field; pass both empty to remove it.');
+      choice.validFrom = from;
+      choice.validTo = to;
+    }
+    if (opts.keyDateField !== undefined) choice.keyDate = dateField(opts.keyDateField, 'key_date_field');
+    choices.set(input.alias, choice);
+  }
+
+  const result = writeTemporalJoin(xml, nodeName, inputs, choices);
+  if (!result.enabled && inputs.some((i) => i.timeDependent)) {
+    const lock = await putModel(client, compositeProviderName, result.xml, timestamp, opts.transport);
+    return JSON.stringify({
+      success: true,
+      message: `No input of CompositeProvider ${cpUpper} takes part with its validity any more, so the join is not temporal. Call bw_activate to activate.`,
+      temporal_join: false,
+      lock_handle: lock,
+      composite_provider_name: cpUpper,
+      object_type: 'hcpr',
+    });
+  }
+  if (!result.enabled) {
+    throw new Error(
+      `CompositeProvider ${cpUpper} has no time-dependent input, so there is nothing to join over time. ` +
+      'A temporal join needs a characteristic with time-dependent attributes as an input (the characteristic has to be usable as an InfoProvider), ' +
+      'or an aDSO input with valid_from_field and valid_to_field.');
+  }
+  const lockHandle = await putModel(client, compositeProviderName, result.xml, timestamp, opts.transport);
+  return JSON.stringify({
+    success: true,
+    message: `Temporal join of CompositeProvider ${cpUpper} written. Call bw_activate to activate.`,
+    temporal_join: true,
+    inputs: result.providers,
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+  });
+}
+
+const FILTER_ELEMENT = /<filterExpression\b(?:[^>\/]|\/(?!>))*(?:\/>|>[\s\S]*?<\/filterExpression>)/;
+
+/**
+ * The SQL filter of the view node: the condition every record of the node has to meet. It sits
+ * between the fields and the inputs of the node; an empty expression removes it.
+ */
+export function setNodeFilter(xml: string, expression: string): { xml: string; changed: boolean; previous: string } {
+  const node = xml.match(/<viewNode\b[\s\S]*?<\/viewNode>/)?.[0];
+  if (!node) throw new Error('The CompositeProvider has no view node.');
+  const existing = node.match(FILTER_ELEMENT)?.[0];
+  const decode = (text: string) => text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  const previous = decode(existing?.match(/<formula>([\s\S]*?)<\/formula>/)?.[1] ?? '');
+  const wanted = expression.replace(/\r/g, '').trim();
+  if (wanted === previous.trim()) return { xml, changed: false, previous };
+  const escaped = wanted.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const element = wanted ? `<filterExpression language="SQL"><formula>${escaped}</formula></filterExpression>` : '';
+  let newNode = existing ? node.replace(existing, () => '') : node;
+  if (element) {
+    const at = newNode.search(/<input\b/);
+    newNode = at >= 0
+      ? newNode.slice(0, at) + element + newNode.slice(at)
+      : newNode.replace(/<\/viewNode>$/, () => `${element}</viewNode>`);
+  }
+  return { xml: xml.replace(node, () => newNode), changed: true, previous };
+}
+
+/**
+ * bw_update_composite_provider action "update_filter" — set or remove the SQL filter of the
+ * view node.
+ */
+export async function bwUpdateCompositeProviderFilter(
+  client: BwClient,
+  compositeProviderName: string,
+  expression: string | undefined,
+  transport?: string,
+): Promise<string> {
+  const cpUpper = compositeProviderName.toUpperCase();
+  if (expression === undefined) throw new Error('update_filter requires filter_expression (an empty text removes the filter).');
+  const cpResult = await readModel(compositeProviderName);
+  const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
+  if (expression.trim() && isTemporalJoin(cpResult.body)) {
+    throw new Error(`CompositeProvider ${cpUpper} is a temporal join, and BW does not allow an SQL filter on one.`);
+  }
+  const result = setNodeFilter(cpResult.body, expression);
+  if (!result.changed) {
+    return JSON.stringify({
+      success: true,
+      changed: false,
+      message: `CompositeProvider ${cpUpper} already has this filter. Nothing was saved.`,
+      filter_expression: result.previous,
+    });
+  }
+  const lockHandle = await putModel(client, compositeProviderName, result.xml, timestamp, transport);
+  // The server accepts a document and can leave the filter out; the stored one is reported.
+  const saved = (await readModel(compositeProviderName)).body;
+  const stored = setNodeFilter(saved, '').previous;
+  const wanted = expression.replace(/\r/g, '').trim();
+  if (stored.trim() !== wanted) {
+    return JSON.stringify({
+      success: false,
+      message: `CompositeProvider ${cpUpper} was saved, but the server did not keep the filter as given.`,
+      filter_expression: stored,
+      lock_handle: lockHandle,
+      composite_provider_name: cpUpper,
+      object_type: 'hcpr',
+    });
+  }
+  return JSON.stringify({
+    success: true,
+    message: wanted
+      ? `SQL filter of CompositeProvider ${cpUpper} set. Call bw_activate to activate; the expression itself is checked by the activation.`
+      : `SQL filter of CompositeProvider ${cpUpper} removed. Call bw_activate to activate.`,
+    filter_expression: wanted,
+    ...(result.previous ? { previous_filter_expression: result.previous } : {}),
+    lock_handle: lockHandle,
+    composite_provider_name: cpUpper,
+    object_type: 'hcpr',
+  });
+}
+
 /**
  * bw_update_composite_provider action "update_group" — declare a field group, change its
  * label, or rename it together with every field that sits in it.
@@ -1418,7 +2198,7 @@ export async function bwUpdateCompositeProviderGroup(
   if (!group) throw new Error('update_group requires dimension (the group name).');
   const newName = opts.newName?.trim().toUpperCase();
 
-  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const cpResult = await readModel(compositeProviderName);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
   let xml = cpResult.body;
   const declared = compositeGroups(xml);
@@ -1566,7 +2346,7 @@ export async function bwUpdateCompositeProviderNavigationAttributes(
     throw new Error('update_navigation_attributes requires navigation_attributes (one or more attribute names).');
   }
 
-  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const cpResult = await readModel(compositeProviderName);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
   let xml = cpResult.body;
 
@@ -1656,6 +2436,19 @@ export interface JoinKeyPair {
   left: string;
   /** Bare field name on the right input's own source provider. */
   right: string;
+  /** How the two keys are compared: EQ (default), NE, LT, LE, GT or GE. */
+  operator?: string;
+}
+
+const JOIN_OPERATORS = ['EQ', 'NE', 'LT', 'LE', 'GT', 'GE'];
+
+/** The operator of a key pair in the form BW stores it, or an error text. */
+export function joinOperatorOf(pair: JoinKeyPair): string {
+  const operator = (pair.operator ?? 'EQ').trim().toUpperCase();
+  if (!JOIN_OPERATORS.includes(operator)) {
+    throw new Error(`Unknown join operator "${pair.operator}" for ${pair.left} / ${pair.right}. Valid operators: ${JOIN_OPERATORS.join(', ')}.`);
+  }
+  return operator;
 }
 
 /** The join element between exactly this alias pair, self-closing or with a body. */
@@ -1767,10 +2560,9 @@ async function resolveInputProviderMeta(
     new RegExp(`<input\\b[^>]*\\balias="${escapeRegex(alias)}"[^>]*>[\\s\\S]*?<\\/input>`)
   );
   if (!inputMatch) throw new Error(`Could not find input ${alias} in CompositeProvider ${cpUpper}.`);
-  const providerName = extractProviderNameFromInput(inputMatch[0]);
-  if (!providerName) throw new Error(`Could not determine the source InfoProvider for input ${alias}.`);
-  const { fields } = await fetchCompositeSourceFields(providerName);
-  return { providerName, fields };
+  const source = await inputSource(inputMatch[0]);
+  if (!source) throw new Error(`Could not determine the source InfoProvider for input ${alias}.`);
+  return source;
 }
 
 /**
@@ -1814,13 +2606,17 @@ export async function bwUpdateCompositeProviderJoin(
 ): Promise<string> {
   const { joinType = 'inner', cardinality = 'CN_N', transport } = opts;
   const cpUpper = compositeProviderName.toUpperCase();
-  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const cpResult = await readModel(compositeProviderName);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
   let xml = cpResult.body;
 
   const viewNodeName = getViewNodeName(xml);
   const left = leftAlias.trim();
   const right = rightAlias.trim();
+  const operators = keyPairs.map(joinOperatorOf);
+  // BW keeps the operators only on its own join type; a join of equalities alone stays the
+  // plain one, as the modeling tools write it.
+  const withOperators = operators.some((op) => op !== 'EQ');
 
   const [leftMeta, rightMeta] = await Promise.all([
     resolveInputProviderMeta(xml, left, cpUpper),
@@ -1841,20 +2637,42 @@ export async function bwUpdateCompositeProviderJoin(
         `${resolveSourceFieldName(rightMeta.fields, k.right, rightMeta.providerName)}` +
         `</rightElementName>`
     ),
+    ...(withOperators ? operators.map((op) => `    <joinOperator>${op}</joinOperator>`) : []),
   ].join('\n');
 
   // The server wants every key pair mapped onto a common target field ("join fields need at
   // least one common target field"). The modeling tools create that when a condition is
   // added: the target of the left key is reused or created, and the right key is mapped onto
   // it as well. A mapping the right key already has onto a field of its own stays.
-  const released = releaseJoinKeys(xml, left, right, keyPairs.map((k) => ({
+  const released = releaseJoinKeys(xml, left, right, keyPairs.filter((k) => joinOperatorOf(k) === 'EQ').map((k) => ({
     leftKey: resolveSourceFieldName(leftMeta.fields, k.left, leftMeta.providerName),
     rightKey: resolveSourceFieldName(rightMeta.fields, k.right, rightMeta.providerName),
   })));
   xml = released.xml;
 
   const commonTargets: Array<{ left: string; right: string; target: string; created: boolean }> = [];
+  const ownTargets: Array<{ input: string; key: string; target: string }> = [];
   for (const pair of keyPairs) {
+    // Two keys that are compared for anything but equality hold different values, so each
+    // gets a target field of its own; the server refuses a join key without one.
+    if (joinOperatorOf(pair) !== 'EQ') {
+      for (const [alias, meta, key] of [[left, leftMeta, pair.left], [right, rightMeta, pair.right]] as const) {
+        const source = resolveSourceFieldName(meta.fields, key, meta.providerName);
+        if (mappedTargets(xml, alias, source).length > 0) continue;
+        const bare = key.trim().toUpperCase();
+        const target = dedupeTargetName(shortenTargetName(bare), xml, new Set());
+        const resolved = resolveMappings([{ target, source: bare }], meta.fields, meta.providerName, viewNodeName, xml);
+        if (resolved.newElementsXml.length > 0) {
+          xml = injectBeforeAnchor(openViewNode(xml), resolved.newElementsXml.join('\n'), ['<input', '<join'], '</viewNode>');
+        }
+        xml = declareGroups(xml, resolved.groups);
+        xml = ensureNamespace(xml, 'BwCore', 'http://www.sap.com/bw/modeling/BwCore.ecore');
+        xml = ensureNamespace(xml, 'Type', 'http://www.sap.com/ndb/DataModelType.ecore');
+        xml = appendMappings(xml, alias, resolved.mappingsXml);
+        ownTargets.push({ input: alias, key: bare, target });
+      }
+      continue;
+    }
     const leftSource = resolveSourceFieldName(leftMeta.fields, pair.left, leftMeta.providerName);
     const rightSource = resolveSourceFieldName(rightMeta.fields, pair.right, rightMeta.providerName);
     const leftTargets = mappedTargets(xml, left, leftSource);
@@ -1882,7 +2700,7 @@ export async function bwUpdateCompositeProviderJoin(
   }
 
   const joinXml =
-    `  <join leftInput="#///${viewNodeName}/${left}" rightInput="#///${viewNodeName}/${right}"` +
+    `  <join${withOperators ? ' xsi:type="Composite:BwJoin"' : ''} leftInput="#///${viewNodeName}/${left}" rightInput="#///${viewNodeName}/${right}"` +
     ` joinType="${joinType}" cardinality="${cardinality}">\n` +
     `${keyLines}\n` +
     `  </join>`;
@@ -1895,7 +2713,7 @@ export async function bwUpdateCompositeProviderJoin(
 
   const lockHandle = await client.lock('hcpr', compositeProviderName);
   try {
-    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
+    await client.put('hcpr', compositeProviderName, lockHandle, leaveScope(xml), timestamp, transport);
   } catch (err) {
     await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
     throw err;
@@ -1911,6 +2729,10 @@ export async function bwUpdateCompositeProviderJoin(
           commonTargets.map((c) =>
             `${c.right} of ${right} is now also mapped onto ${c.target}${c.created ? ' (created)' : ''}`).join('; ') + '.'
         : '') +
+      (ownTargets.length
+        ? ' A key that is not compared for equality needs a target field of its own: ' +
+          ownTargets.map((o) => `${o.key} of ${o.input} is now mapped onto ${o.target}`).join('; ') + '.'
+        : '') +
       (released.released.length
         ? ` No longer join keys, so ${right} no longer feeds ` +
           released.released.map((r) => `${r.target} (from ${r.key})`).join(', ') + '.'
@@ -1920,7 +2742,9 @@ export async function bwUpdateCompositeProviderJoin(
     object_type: 'hcpr',
     join_type: joinType,
     cardinality,
+    ...(withOperators ? { operators: keyPairs.map((k, i) => `${k.left.trim().toUpperCase()} ${operators[i]} ${k.right.trim().toUpperCase()}`) } : {}),
     ...(commonTargets.length ? { common_target_fields: commonTargets } : {}),
+    ...(ownTargets.length ? { own_target_fields: ownTargets } : {}),
     ...(released.released.length ? { released_key_mappings: released.released } : {}),
   });
 }
@@ -1934,7 +2758,7 @@ export async function bwRemoveCompositeProviderJoin(
   transport?: string
 ): Promise<string> {
   const cpUpper = compositeProviderName.toUpperCase();
-  const cpResult = await freshRead(HCPR_PATH(compositeProviderName), HCPR_ACCEPT);
+  const cpResult = await readModel(compositeProviderName);
   const timestamp = cpResult.headers['timestamp'] ?? cpResult.headers['TIMESTAMP'];
   let xml = cpResult.body;
 
@@ -1967,7 +2791,7 @@ export async function bwRemoveCompositeProviderJoin(
 
   const lockHandle = await client.lock('hcpr', compositeProviderName);
   try {
-    await client.put('hcpr', compositeProviderName, lockHandle, xml, timestamp, transport);
+    await client.put('hcpr', compositeProviderName, lockHandle, leaveScope(xml), timestamp, transport);
   } catch (err) {
     await client.unlock('hcpr', compositeProviderName).catch(() => {/* ignore */});
     throw err;
