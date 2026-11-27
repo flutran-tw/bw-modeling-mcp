@@ -1,5 +1,29 @@
 # Changelog
 
+## [2.1.1] — 2026-11-26
+
+### Fixed
+
+- **Query edits keep the texts of elements that have none in the logon language** — a query, a reusable structure, a calculated or restricted key figure or a variable is read and saved in one language, and BW rewrites the texts of that language on every save. An element whose own text existed in another language only came back empty and was saved as "no text": after an edit in a logon language the query was not written in, structure members showed their technical ids in every language (#56). The tools that change such an object now compare the read with one in the master language of the object and, when the logon language lacks texts the master language has, read and save in the master language. The result says so, and descriptions passed in that call are stored as texts of that language. When each of the two languages lacks texts the other has, the edit is refused with the elements at fault, because no save keeps them all. Elements left without a text in the language of the save are named in the result. The read for a save runs on a new session and bypasses the server buffer, so texts written shortly before, for example by a translation, are not overwritten by an older state. Verified on BW/4HANA and on SAP BW 7.5: an edit in a second language left the member texts of a query and of a reusable structure in place, where the previous version marked them as empty. Thanks to @army113 for the analysis in #56 and #57.
+
+- **`bw_update_query_characteristic` stores a description in the language of the save** — a query-specific description was also stored as a German text, whatever the logon language was. It is now stored in the language the query is saved in, which the result names as `description_language`.
+
+- **`bw_create_infoobject` creates a reference characteristic** — `referenced_infoobject` was accepted and reported back, but never sent, so the characteristic was created on its own with the default type (#58). The referenced characteristic is now read before anything is locked, and the new one takes its data type, length, conversion routine, lowercase handling, master data and texts from it. A value for one of these that differs from the referenced characteristic is refused, and so is a reference to an InfoObject that is not a characteristic or that is a reference itself. After the save the reference is read back, and the call fails when BW did not keep it. Verified on BW/4HANA and on SAP BW 7.5: a characteristic created as a reference and activated, with the referenced characteristic as its basic characteristic. Thanks to @army113 for the analysis in #58 and #59.
+
+- **Descriptions of fields without an InfoObject are kept** — `update_fields` with `field_description` on a plain field, for example one fed by a SAP HANA view, stores the text where the server keeps it. Before, the call reported success and the text was dropped on save.
+
+- **Navigation attributes on CompositeProviders with SAP HANA view inputs** — `update_navigation_attributes` no longer stops with HTTP 404 when one of the inputs that supply the field is a SAP HANA view; BW resolves the attribute through the InfoObject.
+
+- **Navigation attributes on fields with a unique name activate** — a field that is not exposed under its InfoObject name needs a local name for each navigation attribute. `update_navigation_attributes` now assigns one the way the modeling tools propose it, and so does switching such a field to `name_usage: "unique_name"`. Before, activation asked for the local name.
+
+- **Unknown keys in `mappings` are refused** — `add_input` and `update_mapping` answer a mapping with a key the tool does not know, or with an invalid `name_usage`, with the allowed keys, and nothing is written. Before, the key was dropped and the CompositeProvider was built without the requested binding.
+
+### Improved
+
+- **Red InfoPackage requests show why they failed** — on a classic release, `bw_read_metadata_tables` with `ISIP` lists under each red request of the load history its error messages from the monitor log, with the message text in the logon language and the file the request read. With `RSPCLOG`, a red chain run lists the red load requests that belong to it in the same way, so the cause of a failed load step shows without the monitor transaction (#54). A message the monitor repeats per data package is listed once. A red DTP request is named, and its log stays with the request. Verified on SAP BW 7.5 against red InfoPackage requests. Thanks to @army113 for the proposal in #54 and #55.
+
+- **`bw_read` lists field descriptions of a CompositeProvider** — every field in the result carries its `description`.
+
 ## [2.1.0] — 2026-11-23
 
 ### Before you update

@@ -64,7 +64,7 @@ import {
   bwUpdateCompositeProviderFields,
   bwUpdateCompositeProviderGroup,
   bwUpdateCompositeProviderNavigationAttributes,
-  NameUsage, bwUpdateCompositeProviderFilter, bwReplaceCompositeProviderInput, bwInsertCompositeProviderNode, bwRemoveCompositeProviderNode, bwUpdateCompositeProviderTemporalJoin } from './tools/composite_provider.js';
+  NameUsage, parseFieldMappings, bwUpdateCompositeProviderFilter, bwReplaceCompositeProviderInput, bwInsertCompositeProviderNode, bwRemoveCompositeProviderNode, bwUpdateCompositeProviderTemporalJoin } from './tools/composite_provider.js';
 import { bwUpdateCompositeProvider, CompositeProviderFieldAction } from './tools/composite_provider_update.js';
 import { selectNode, scopeNotes } from './tools/composite_provider_nodes.js';
 import { bwGetCkf, bwGetRkf, bwGetStructure, bwGetVariable } from './tools/cp_components.js';
@@ -845,7 +845,10 @@ const TOOL_DEFINITIONS = [
           },
           referenced_infoobject: {
             type: 'string',
-            description: 'Characteristic: Reference to an existing InfoObject (e.g. "IOBJ_NAME"). Omit withMasterData/withTexts — they are inherited. Default "".',
+            description: 'Characteristic: create it as a reference to this active characteristic (e.g. "IOBJ_NAME"). ' +
+              'Data type, length, conversion routine, lowercase handling, master data and texts come from the referenced ' +
+              'characteristic: leave data_type, length, conversion_routine, lower_case, with_master_data and with_texts out ' +
+              '(a value that differs is refused). The referenced characteristic must not be a reference itself.',
           },
           compound_infoobjects: {
             type: 'array',
@@ -4414,7 +4417,7 @@ const TOOL_DEFINITIONS = [
               'among themselves, so read the "After" line of each step. ' +
               'RSPCLOG: process chain runs — a chain name gives the run history plus the steps of the ' +
               'newest run, a 25-character log id the steps of that run, a pattern with * the last status ' +
-              'of every matching chain; the message log of a failed step is not readable here. ' +
+              'of every matching chain; a red run lists its red load requests, an InfoPackage request with its error messages and the file it read. ' +
               'PLSE: planning function type, aggregation level, characteristic usage, conditions, ' +
               'parameters, FOX formula as source code. PLSQ: planning sequence steps in execution order. ' +
               'PLCR: planning properties and characteristic relationships. PLDS: data slices (no REST ' +
@@ -4424,7 +4427,7 @@ const TOOL_DEFINITIONS = [
               'constants), filters, formulas and routine code; a pattern with * lists the analysis ' +
               'processes, which bw_search cannot find. ' +
               'ISIP: InfoPackage (classic only) — DataSource, file settings, selections with routines, ' +
-              'deletion settings, the process chains using it, load history. ' +
+              'deletion settings, the process chains using it, load history with the error messages and the file of each red request. ' +
               'UPDR: 3.x update rules (classic only) — target, InfoSource, key figure rules with update ' +
               'type, characteristic rules, start routine, global part and rule routines as source code; a ' +
               'provider name lists the update rules that load it, a pattern with * (on the target) lists ' +
@@ -8348,14 +8351,7 @@ async function handleToolCall(
         const cpAction = (args?.action as string | undefined) ?? 'add_field';
         selectNode(args?.node as string | undefined);
         const cpTransport = args?.transport as string | undefined;
-        const cpMappings = ((args?.mappings as Array<Record<string, string>> | undefined) ?? []).map((m) => ({
-          target: m.target,
-          source: m.source,
-          constantValue: m.constant_value,
-          infoObjectName: m.info_object_name,
-          nameUsage: m.name_usage as NameUsage | undefined,
-          dimension: m.dimension,
-        }));
+        const cpMappings = parseFieldMappings(args?.mappings);
         const cpDefaults = {
           nameUsage: args?.name_usage as NameUsage | undefined,
           dimension: args?.dimension as string | undefined,

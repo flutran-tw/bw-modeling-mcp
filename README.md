@@ -49,19 +49,44 @@ Principal propagation additionally needs a certificate rule and ICM trust on the
 
 ---
 
-## 📖 Featured Blog Posts
+## 📖 Further Reading
 
-A two-part blog series about this project (both available in German and English):
+Overview page: **[Agentic AI for SAP BW](https://www.nextlytics.com/en/agentic-ai-for-sap-bw)** — what the server does, use cases and the hosting options.
 
-1. **Agentic AI meets SAP BW** — the full story behind this project: why I built it, what's inside, what happens when Claude walks through a complete BW data lineage on its own.
+Three blog posts about this project (all available in German and English):
+
+1. April 2026 · **Agentic AI meets SAP BW** — the full story behind this project: why I built it, what's inside, what happens when Claude walks through a complete BW data lineage on its own.
    https://www.nextlytics.com/blog/agentic-ai-meets-sap-bw
 
-2. **Agentic AI in practice: MCP server for SAP BW/4HANA** — how the server is operated company-wide on SAP BTP Cloud Foundry with role-based access and per-user identity, plus two real customer projects.
+2. July 2026 · **Agentic AI in practice: MCP server for SAP BW/4HANA** — how the server is operated company-wide on SAP BTP Cloud Foundry with role-based access and per-user identity, plus two real customer projects.
    https://www.nextlytics.com/blog/agentic-ai-in-practice-mcp-server-for-sap-bw/4hana
+
+3. November 2026 · **Agentic Planning with Analysis for Office** — a planning model built by an agent in SAP BW, from the aDSO to the planning function, and the workbook that plans on it, built with [afo-mcp](https://github.com/dnic-dev/afo-mcp), the MCP server for Analysis for Office workbooks.
+   https://www.nextlytics.com/blog/agentic-planning-analysis-for-office
 
 ---
 
-## 🆕 What's New — v2.1.0 · Security Hardening and Deeper Modeling
+## 🆕 What's New — v2.1.1 · Fixes for Query Texts and Reference Characteristics
+
+A maintenance release on top of v2.1.0, whose highlights follow below. No tool was added
+and nothing changes in the configuration.
+
+- **Query edits keep element texts** — editing a query, a reusable structure, a calculated
+  or restricted key figure or a variable in a logon language that lacks some of its texts
+  no longer marks those elements as having no text. The object is then read and saved in
+  its master language, and the result says so (#56)
+- **Reference characteristics** — `bw_create_infoobject` with `referenced_infoobject`
+  creates the characteristic as a reference; before, it was created on its own (#58)
+- **CompositeProviders** — descriptions of fields without an InfoObject are kept, navigation
+  attributes work over SAP HANA view inputs and on fields with a unique name, and a mapping
+  with an unknown key is refused
+- **Why a load failed, on SAP BW 7.5** — the load history of an InfoPackage and a red
+  process chain run show the error messages of each red InfoPackage request and the file
+  it read (#54)
+
+Details: [CHANGELOG.md](CHANGELOG.md).
+
+## What's New — v2.1.0 · Security Hardening and Deeper Modeling
 
 Two directions again: the server checks more before it acts — the certificate of the BW
 system, every tool call, every request it sends — and the modeling tools reach further
