@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.1.1~franzz1] - 2026-11-27
+
+- Merge upstream v2.1.1 into bw-migration.
+- Conflict in `src/index.ts` (`bw_read_metadata` InfoPackage description): kept our 3.x text (UPDR/ISTS/ISFS/ISTD) and added upstream's new wording on the error messages and files of red requests.
+
 ## [2.1.0~franzz1] - 2026-11-25
 
 - Merge upstream v2.1.0 into bw-migration.
