@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.1.1~franzz2] - 2026-11-27
+
+- Read the source of generated-class routines through `bw_read_metadata_tables` (`bw_find` operation=metadata_tables) with `object_type=AMDP` and the transformation id, in `src/tools/metadata_amdp.ts`. BW/4HANA keeps AMDP (SQLScript) start, end, expert and field routines as methods of the generated class `/BIC/…_M`, which `TRFN` (RSAABAP) does not return. The class and method names come from the transformation definition (`classNameM`, `methodNameM`), the class source from ADT (active version, then inactive), and the result is JSON with one entry per routine: kind, rule, class, method, language (`amdp` or `abap`), code, target fields. Read-only.
+- Upstream touch points, to re-check on each merge: `import`, `SUPPORTED`, `NAME_WIDTHS` and `case 'AMDP'` in `src/tools/metadata_tables.ts`, and two description lines in `src/index.ts`.
+
 ## [2.1.1~franzz1] - 2026-11-27
 
 - Merge upstream v2.1.1 into bw-migration.

@@ -4387,6 +4387,7 @@ const TOOL_DEFINITIONS = [
         'ODSO classic DSO, CUBE InfoCube, MPRO MultiProvider (parts with their type) — each with load history; ' +
         'ADSO load history only; RECORDS stored row counts as JSON (object_name="ADSO|IOBJ|ODSO|CUBE:NAME"); ' +
         'QUSE master data a query uses (texts, navigation attributes) as JSON; ' +
+        'AMDP source of the routines in the generated class of a transformation (BW/4HANA AMDP SQLScript, or ABAP) as JSON; ' +
         'ANPR analysis process (nodes, field rules, routine code; "Z*" lists them); ' +
         'ISIP InfoPackage (a DataSource name lists its InfoPackages); ' +
         '3.x data flow (classic only; "*" lists them with their version): UPDR update rules, ISTS transfer ' +
@@ -4404,6 +4405,7 @@ const TOOL_DEFINITIONS = [
               'Object type to read. ' +
               'RECORDS: exact stored row counts as JSON; object_name="ADSO|IOBJ|ODSO|CUBE:NAME". ' +
               'QUSE: texts and navigation attributes a query uses, as JSON; object_name is the query. ' +
+              'AMDP: start, end, expert and field routine source read from the generated class (/BIC/…_M) of a transformation, as JSON; object_name is the transformation id. ' +
               'TRFN: rules incl. start/end/expert and field routine source code. ' +
               'DTPA: settings; the filter definition (selections, filter routine, semantic group, package ' +
               'sizes) is a serialised ABAP object, reported only where the optional helper endpoint of ' +
